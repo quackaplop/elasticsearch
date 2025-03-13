@@ -12,6 +12,7 @@ package org.elasticsearch.action;
 import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
+import org.elasticsearch.core.FixForMultiProject;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -43,6 +44,7 @@ public final class ResultDeduplicator<T, R> {
      * @param listener Listener to invoke on request completion
      * @param callback Callback to be invoked with request and completion listener the first time the request is added to the deduplicator
      */
+    @FixForMultiProject(description = "this does not work with project IDs in the thread context (for at least DLM)")
     public void executeOnce(T request, ActionListener<R> listener, BiConsumer<T, ActionListener<R>> callback) {
         ActionListener<R> completionListener = requests.computeIfAbsent(request, CompositeListener::new)
             .addListener(ContextPreservingActionListener.wrapPreservingContext(listener, threadContext));
