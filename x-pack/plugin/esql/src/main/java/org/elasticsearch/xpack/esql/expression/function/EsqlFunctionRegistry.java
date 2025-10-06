@@ -193,6 +193,7 @@ import org.elasticsearch.xpack.esql.expression.function.scalar.string.Substring;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.ToLower;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.ToUpper;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.Trim;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.json.JsonExtract;
 import org.elasticsearch.xpack.esql.expression.function.scalar.util.Delay;
 import org.elasticsearch.xpack.esql.expression.function.vector.CosineSimilarity;
 import org.elasticsearch.xpack.esql.expression.function.vector.DotProduct;
@@ -537,7 +538,9 @@ public class EsqlFunctionRegistry {
                 def(UrlEncode.class, UrlEncode::new, "url_encode"),
                 def(UrlDecode.class, UrlDecode::new, "url_decode"),
                 def(PresentOverTime.class, uni(PresentOverTime::new), "present_over_time"),
-                def(AbsentOverTime.class, uni(AbsentOverTime::new), "absent_over_time") } };
+                def(AbsentOverTime.class, uni(AbsentOverTime::new), "absent_over_time"),
+                def(JsonExtract.class, JsonExtract::new, "json_extract"),
+            } };
     }
 
     public EsqlFunctionRegistry snapshotRegistry() {

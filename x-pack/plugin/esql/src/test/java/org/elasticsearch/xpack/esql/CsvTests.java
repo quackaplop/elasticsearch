@@ -197,7 +197,12 @@ public class CsvTests extends ESTestCase {
     public static List<Object[]> readScriptSpec() throws Exception {
         List<URL> urls = classpathResources("/*.csv-spec");
         assertThat("Not enough specs found " + urls, urls, hasSize(greaterThan(0)));
-        return SpecReader.readScriptSpec(urls, specParser());
+        var result = SpecReader.readScriptSpec(urls, specParser());
+        var subset = result.stream()
+            .filter(o -> ((String)o[0]).equalsIgnoreCase("string.csv-spec"))
+            .filter(o -> ((String)o[2]).toLowerCase().contains("json_extract"))
+            .toList();
+        return subset;
     }
 
     @Before

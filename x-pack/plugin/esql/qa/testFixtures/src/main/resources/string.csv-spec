@@ -2684,3 +2684,14 @@ ROW u = ["https://www.example.com/papers?q=information+retrieval&year=2024&citat
 u:keyword
 ["https://www.example.com/papers?q=information+retrieval&year=2024&citations=high", "", "!#$&'()+/:;=?@[]", "💨🔥🪨💧"]
 ;
+
+json_extract
+FROM  movies 
+| SORT id 
+| EVAL result = json_extract(title, "title") 
+| KEEP id, result, details 
+| LIMIT 1;
+
+id:integer  | result:keyword | details:keyword
+0           | The Last Stand | AABC
+;

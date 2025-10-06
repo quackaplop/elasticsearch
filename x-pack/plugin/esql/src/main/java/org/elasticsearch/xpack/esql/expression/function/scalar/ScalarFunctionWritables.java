@@ -53,6 +53,7 @@ import org.elasticsearch.xpack.esql.expression.function.scalar.string.StartsWith
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.Substring;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.ToLower;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.ToUpper;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.json.JsonExtract;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.And;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.Or;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.In;
@@ -81,6 +82,7 @@ public class ScalarFunctionWritables {
         entries.add(Hypot.ENTRY);
         entries.add(In.ENTRY);
         entries.add(InsensitiveEquals.ENTRY);
+        entries.add(JsonExtract.ENTRY);
         entries.add(DateExtract.ENTRY);
         entries.add(DateDiff.ENTRY);
         entries.add(DateFormat.ENTRY);

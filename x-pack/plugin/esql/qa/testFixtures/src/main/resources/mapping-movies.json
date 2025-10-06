@@ -1,0 +1,19 @@
+{
+  "properties": {
+    "id": {
+      "type": "integer"
+    },
+    "title": {
+      "type": "keyword"
+    },
+    "year": {
+      "type": "integer"
+    },
+    "rating": {
+      "type": "float"
+    },
+    "details": {
+      "type": "keyword"
+    }
+  }
+}
