@@ -74,7 +74,6 @@ import static org.elasticsearch.xpack.esql.CsvTestsDataLoader.loadDataSetIntoEs;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.classpathResources;
 import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.COMPLETION;
 import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.KNN_FUNCTION_V5;
-import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.METRICS_COMMAND;
 import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.RERANK;
 import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.SEMANTIC_TEXT_FIELD_CAPS;
 import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.SOURCE_FIELD_MAPPING;
@@ -123,9 +122,11 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
     }
 
     private static boolean dataLoaded = false;
+    protected static boolean testClustersOk = true;
 
     @Before
     public void setup() throws IOException {
+        assumeTrue("test clusters were broken", testClustersOk);
         boolean supportsLookup = supportsIndexModeLookup();
         boolean supportsSourceMapping = supportsSourceFieldMapping();
         boolean supportsInferenceTestService = supportsInferenceTestService();
@@ -141,6 +142,9 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
 
     @AfterClass
     public static void wipeTestData() throws IOException {
+        if (testClustersOk == false) {
+            return;
+        }
         try {
             dataLoaded = false;
             adminClient().performRequest(new Request("DELETE", "/*"));
@@ -163,11 +167,25 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
             shouldSkipTest(testName);
             doTest();
         } catch (Exception e) {
+            ensureTestClustersAreOk(e);
             throw reworkException(e);
         }
     }
 
+    protected void ensureTestClustersAreOk(Exception failure) {
+        try {
+            ensureHealth(client(), "", (request) -> {
+                request.addParameter("wait_for_status", "yellow");
+                request.addParameter("level", "shards");
+            });
+        } catch (Exception inner) {
+            testClustersOk = false;
+            failure.addSuppressed(inner);
+        }
+    }
+
     protected void shouldSkipTest(String testName) throws IOException {
+        assumeTrue("test clusters were broken", testClustersOk);
         if (requiresInferenceEndpoint()) {
             assumeTrue("Inference test service needs to be supported", supportsInferenceTestService());
         }
@@ -176,16 +194,6 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
         if (supportsSourceFieldMapping() == false) {
             assumeFalse("source mapping tests are muted", testCase.requiredCapabilities.contains(SOURCE_FIELD_MAPPING.capabilityName()));
         }
-        if (testCase.requiredCapabilities.contains(METRICS_COMMAND.capabilityName())) {
-            assumeTrue("Skip time-series tests in mixed clusters until the development stabilizes", supportTimeSeriesCommand());
-        }
-    }
-
-    /**
-     * Skip time-series tests in mixed clusters until the development stabilizes
-     */
-    protected boolean supportTimeSeriesCommand() {
-        return true;
     }
 
     protected static void checkCapabilities(
@@ -385,7 +393,9 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
 
     @After
     public void assertRequestBreakerEmptyAfterTests() throws Exception {
-        assertRequestBreakerEmpty();
+        if (testClustersOk) {
+            assertRequestBreakerEmpty();
+        }
     }
 
     public static void assertRequestBreakerEmpty() throws Exception {
