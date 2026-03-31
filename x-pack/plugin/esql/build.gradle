@@ -44,6 +44,7 @@ dependencies {
   implementation project(':libs:dissect')
   implementation project(':libs:grok')
   implementation project(':libs:web-utils')
+  implementation project(':libs:user-agent-api')
   implementation project(':libs:exponential-histogram')
   api "org.apache.lucene:lucene-spatial3d:${versions.lucene}"
   api "org.antlr:antlr4-runtime:${versions.antlr4}"
@@ -65,9 +66,15 @@ dependencies {
   testImplementation project(path: xpackModule('kql'))
   testImplementation project(path: xpackModule('mapper-unsigned-long'))
 
+  testImplementation project(path: xpackModule('esql-datasource-csv'))
+  testImplementation project(path: xpackModule('esql-datasource-http'))
+  testImplementation project(path: xpackModule('esql-datasource-compression-libs'))
   testImplementation project(path: xpackModule('esql-datasource-gzip'))
   testImplementation project(path: xpackModule('esql-datasource-zstd'))
   testImplementation project(path: xpackModule('esql-datasource-bzip2'))
+  testImplementation project(path: xpackModule('esql-datasource-lz4'))
+  testImplementation project(path: xpackModule('esql-datasource-snappy'))
+  testImplementation project(path: xpackModule('esql-datasource-brotli'))
   testImplementation "com.github.luben:zstd-jni:${versions.zstdJni}"
   testImplementation "org.apache.commons:commons-compress:${versions.esql_commons_compress}"
   testImplementation project(path: ':modules:reindex')
@@ -77,11 +84,13 @@ dependencies {
   testImplementation project(path: ':modules:legacy-geo')
   testImplementation project(path: ':modules:data-streams')
   testImplementation project(path: ':modules:mapper-extras')
+  testImplementation project(path: ':modules:user-agent')
   testImplementation project(xpackModule('esql:compute:test'))
   testImplementation('ch.obermuhlner:big-math:2.3.2')
   testImplementation('net.nextencia:rrdiagram:0.9.4')
   testImplementation('org.webjars.npm:fontsource__roboto-mono:4.5.7')
 
+  internalClusterTestImplementation project(":modules:user-agent")
   internalClusterTestImplementation project(":modules:mapper-extras")
   internalClusterTestImplementation project(":plugins:mapper-size")
   internalClusterTestImplementation project(xpackModule('inference:qa:test-service-plugin'))
@@ -429,7 +438,6 @@ tasks.register("regenParser", JavaExec) {
     '-package', 'org.elasticsearch.xpack.esql.parser',
     '-listener',
     '-visitor',
-    '-lib', outputPath,
     '-lib', "${file(grammarPath)}/parser",
     '-o', outputPath,
     "${file(grammarPath)}/EsqlBaseParser.g4"
@@ -681,6 +689,16 @@ tasks.named("test").configure {
 tasks.register("analyzePromqlQueries", JavaExec) {
   mainClass = 'org.elasticsearch.xpack.esql.optimizer.promql.PromqlCoverageAnalyzer'
   classpath = sourceSets.test.runtimeClasspath
-  args project.findProperty("queriesFile") ?: "", project.findProperty("outputFile") ?: ""
+  def arguments = [
+    "--input", project.findProperty("queriesFile") ?: "",
+    "--output", project.findProperty("outputFile") ?: ""
+  ]
+  if (project.hasProperty("outputFormat")) {
+    arguments += ["--format", project.findProperty("outputFormat")]
+  }
+  if (project.hasProperty("verbose")) {
+    arguments += ["--verbose", project.findProperty("verbose")]
+  }
+  args arguments as List<String>
 }
 
