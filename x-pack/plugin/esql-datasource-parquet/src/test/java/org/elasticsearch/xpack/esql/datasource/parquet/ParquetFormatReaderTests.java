@@ -1560,6 +1560,33 @@ public class ParquetFormatReaderTests extends ESTestCase {
         return outputStream.toByteArray();
     }
 
+    /**
+     * Verifies that Parquet files with Snappy-compressed pages can be read.
+     * Downloads Apache Parquet project's own Snappy test fixture (1.7KB, 2 rows, 11 columns).
+     * Snappy is the default page compression for Spark, PyArrow, and the ClickBench dataset.
+     *
+     * See: https://github.com/apache/parquet-testing/tree/master/data
+     */
+    public void testReadSnappyCompressedParquet() throws Exception {
+        byte[] parquetData = downloadUrl("https://raw.githubusercontent.com/apache/parquet-testing/master/data/alltypes_plain.snappy.parquet");
+        StorageObject storageObject = createStorageObject(parquetData);
+        var reader = new ParquetFormatReader(blockFactory);
+        try (var iter = reader.read(storageObject, List.of("id", "int_col", "double_col", "string_col"), 1000)) {
+            assertTrue("Expected at least one page from Snappy-compressed Parquet", iter.hasNext());
+            var page = iter.next();
+            assertEquals(2, page.getPositionCount());
+        }
+    }
+
+    private static byte[] downloadUrl(String url) throws IOException {
+        var connection = new java.net.URL(url).openConnection();
+        connection.setConnectTimeout(10_000);
+        connection.setReadTimeout(30_000);
+        try (var in = connection.getInputStream()) {
+            return in.readAllBytes();
+        }
+    }
+
     private byte[] createParquetFile(MessageType schema, GroupCreator groupCreator) throws IOException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
 
