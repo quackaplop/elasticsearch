@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.datasources;
 
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.CloseableIterator;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
@@ -90,6 +91,33 @@ public final class StreamingParallelParsingCoordinator {
         Executor executor,
         ErrorPolicy errorPolicy
     ) throws IOException {
+        return parallelRead(reader, decompressedStream, projectedColumns, batchSize, parallelism, executor, errorPolicy, null);
+    }
+
+    /**
+     * Variant that propagates the planner-resolved {@code readSchema}. Mirrors the same parameter on
+     * {@link ParallelParsingCoordinator#parallelRead}; the streaming path must thread it so multi-file
+     * globs over gzip/zstd/bz2 inputs honor the planner's typing instead of re-inferring per file.
+     * Pass {@code null} when no read schema is bound.
+     */
+    public static CloseableIterator<Page> parallelRead(
+        SegmentableFormatReader reader,
+        InputStream decompressedStream,
+        List<String> projectedColumns,
+        int batchSize,
+        int parallelism,
+        Executor executor,
+        ErrorPolicy errorPolicy,
+        @Nullable List<Attribute> readSchema
+    ) throws IOException {
+        if (logger.isDebugEnabled()) {
+            logger.debug(
+                "streaming parallelRead: readSchema={}, parallelism={}, projection={}",
+                readSchema == null ? "null" : "present(" + readSchema.size() + ")",
+                parallelism,
+                projectedColumns == null ? "null" : projectedColumns.size()
+            );
+        }
         ErrorPolicy effectivePolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.STRICT;
 
         if (parallelism <= 1) {
@@ -97,6 +125,7 @@ public final class StreamingParallelParsingCoordinator {
                 .projectedColumns(projectedColumns)
                 .batchSize(batchSize)
                 .errorPolicy(effectivePolicy)
+                .readSchema(readSchema)
                 .build();
             return reader.read(new InputStreamStorageObject(decompressedStream), ctx);
         }
@@ -108,7 +137,8 @@ public final class StreamingParallelParsingCoordinator {
             batchSize,
             parallelism,
             executor,
-            effectivePolicy
+            effectivePolicy,
+            readSchema
         );
     }
 
@@ -131,6 +161,9 @@ public final class StreamingParallelParsingCoordinator {
         private final int batchSize;
         private final int parallelism;
         private final ErrorPolicy errorPolicy;
+        /** See {@link FormatReadContext#readSchema()}. {@code null} = per-file inference. */
+        @Nullable
+        private final List<Attribute> readSchema;
 
         private final ArrayBlockingQueue<byte[]> bufferPool;
         private final ArrayBlockingQueue<Chunk> chunkQueue;
@@ -165,13 +198,15 @@ public final class StreamingParallelParsingCoordinator {
             int batchSize,
             int parallelism,
             Executor executor,
-            ErrorPolicy errorPolicy
+            ErrorPolicy errorPolicy,
+            @Nullable List<Attribute> readSchema
         ) {
             this.reader = reader;
             this.projectedColumns = projectedColumns;
             this.batchSize = batchSize;
             this.parallelism = parallelism;
             this.errorPolicy = errorPolicy;
+            this.readSchema = readSchema;
             this.bufferPoolSize = parallelism + 1;
             this.pageQueueRingSize = parallelism + 1;
 
@@ -444,6 +479,7 @@ public final class StreamingParallelParsingCoordinator {
                             .firstSplit(chunk.index == 0)
                             .lastSplit(true)
                             .recordAligned(true)
+                            .readSchema(readSchema)
                             .build();
 
                         try (CloseableIterator<Page> pages = reader.read(chunkObj, ctx)) {

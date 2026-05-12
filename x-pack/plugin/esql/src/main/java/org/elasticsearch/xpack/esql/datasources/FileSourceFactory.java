@@ -251,6 +251,7 @@ final class FileSourceFactory implements ExternalSourceFactory {
                 .pushedExpressions(pushedExpressions)
                 .pushdownSupport(pushdownSupport)
                 .onClose(onClose)
+                .readSchema(context.readSchema())
                 .build();
         };
     }

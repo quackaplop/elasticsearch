@@ -31,6 +31,9 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
         Map<String, Object> sourceMetadata = randomBoolean() ? Map.of() : randomSourceMetadataWithStats();
         Integer estimatedRowSize = randomEstimatedRowSize();
         List<ExternalSplit> splits = randomSplits();
+        // Toggle null vs populated to exercise the wire path that encodes in-memory null as an
+        // empty list, alongside the populated path.
+        List<Attribute> readSchema = randomBoolean() ? null : randomFieldAttributes(1, 5, false);
         return new ExternalSourceExec(
             source,
             sourcePath,
@@ -39,10 +42,12 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
             config,
             sourceMetadata,
             null,
+            List.of(),
             FormatReader.NO_LIMIT,
             estimatedRowSize,
             null,
-            splits
+            splits,
+            readSchema
         );
     }
 
@@ -123,8 +128,9 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
         Map<String, Object> sourceMetadata = instance.sourceMetadata();
         Integer estimatedRowSize = instance.estimatedRowSize();
         List<ExternalSplit> splits = instance.splits();
+        List<Attribute> readSchema = instance.readSchema();
 
-        switch (between(0, 5)) {
+        switch (between(0, 6)) {
             case 0 -> sourcePath = randomValueOtherThan(sourcePath, () -> "s3://bucket/" + randomAlphaOfLength(8) + ".parquet");
             case 1 -> sourceType = randomValueOtherThan(sourceType, () -> randomFrom("parquet", "csv", "file", "iceberg"));
             case 2 -> attributes = randomValueOtherThan(attributes, () -> randomFieldAttributes(1, 5, false));
@@ -134,6 +140,7 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
                 AbstractPhysicalPlanSerializationTests::randomEstimatedRowSize
             );
             case 5 -> splits = randomValueOtherThan(splits, ExternalSourceExecSerializationTests::randomSplits);
+            case 6 -> readSchema = randomValueOtherThan(readSchema, () -> randomBoolean() ? null : randomFieldAttributes(1, 5, false));
             default -> throw new IllegalStateException();
         }
         return new ExternalSourceExec(
@@ -144,10 +151,12 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
             config,
             sourceMetadata,
             null,
+            List.of(),
             FormatReader.NO_LIMIT,
             estimatedRowSize,
             null,
-            splits
+            splits,
+            readSchema
         );
     }
 
