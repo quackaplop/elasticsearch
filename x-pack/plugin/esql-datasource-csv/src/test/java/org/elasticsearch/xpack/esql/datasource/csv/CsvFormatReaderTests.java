@@ -2653,25 +2653,36 @@ public class CsvFormatReaderTests extends ESTestCase {
         assertEquals("1,Inch \" mark,42\n".length(), boundary);
     }
 
-    public void testFindNextRecordBoundaryNewlineInsideBracketMvc() throws IOException {
+    // World 1 (esql-planning#772): record boundaries are quote-only. A bare, unquoted newline
+    // inside [...] DOES terminate the record — brackets are not consulted at the boundary layer.
+    // BWC: these three tests previously asserted the opposite (World 2: bracket depth absorbed
+    // bare newlines). That behavior was internally inconsistent (the bracket scan was not
+    // quote-aware, so `["a]b"]` mis-parsed) and contradicted RFC 4180 and our own CsvTestUtils
+    // convention. A newline that must be part of a multi-value cell now has to be quoted.
+
+    public void testFindNextRecordBoundaryBareNewlineInsideBracketsTerminatesRecord() throws IOException {
         CsvFormatReader reader = newReader();
         byte[] data = "before,[line1\nline2\nline3],after\nnext\n".getBytes(StandardCharsets.UTF_8);
         long boundary = reader.findNextRecordBoundary(new ByteArrayInputStream(data));
-        assertEquals("before,[line1\nline2\nline3],after\n".length(), boundary);
+        // First unquoted \n (after line1) ends the record; the [...] is not a shield.
+        assertEquals("before,[line1\n".length(), boundary);
     }
 
-    public void testFindNextRecordBoundaryNestedBracketMvcWithEmbeddedNewlines() throws IOException {
+    public void testFindNextRecordBoundaryBareNewlineInsideNestedBracketsTerminatesRecord() throws IOException {
         CsvFormatReader reader = newReader();
         byte[] data = "a,[[cell\ninner]],b\nz\n".getBytes(StandardCharsets.UTF_8);
         long boundary = reader.findNextRecordBoundary(new ByteArrayInputStream(data));
-        assertEquals("a,[[cell\ninner]],b\n".length(), boundary);
+        assertEquals("a,[[cell\n".length(), boundary);
     }
 
-    public void testFindNextRecordBoundaryMultiValueSyntaxNoneDoesNotTreatBracketsAsMvc() throws IOException {
-        CsvFormatReader reader = (CsvFormatReader) newReader().withConfig(Map.of("multi_value_syntax", "none"));
-        byte[] data = "before,[not\nmvc],after\nnext\n".getBytes(StandardCharsets.UTF_8);
+    public void testFindNextRecordBoundaryQuotedNewlineInsideBracketsIsRecordInternal() throws IOException {
+        CsvFormatReader reader = newReader();
+        // World 1 contract: to keep a newline inside a multi-value cell, quote the cell. The quote
+        // scanner (unchanged) keeps the embedded \n record-internal; the record ends at the \n
+        // after the closing quote.
+        byte[] data = "before,\"[line1\nline2]\",after\nnext\n".getBytes(StandardCharsets.UTF_8);
         long boundary = reader.findNextRecordBoundary(new ByteArrayInputStream(data));
-        assertEquals("before,[not\n".length(), boundary);
+        assertEquals("before,\"[line1\nline2]\",after\n".length(), boundary);
     }
 
     // --- findLastRecordBoundary tests ---
@@ -2717,10 +2728,22 @@ public class CsvFormatReaderTests extends ESTestCase {
         assertEquals("row1,a\n".length() - 1, boundary);
     }
 
-    public void testFindLastRecordBoundaryRespectsBracketMvc() throws IOException {
-        // Embedded \n inside [..] must not be a boundary.
+    public void testFindLastRecordBoundaryBareNewlineInsideBracketsIsABoundary() throws IOException {
+        // World 1 (esql-planning#772): a bare unquoted \n inside [..] IS a record boundary; the
+        // segmentator does not shield it. BWC: this previously asserted data.length-1 under the
+        // (removed) World-2 bracket-depth absorption. No trailing \n here, so the LAST boundary is
+        // the \n after v2 — proving brackets are not consulted at the boundary layer.
         CsvFormatReader reader = newReader();
-        byte[] data = "a,[v1\nv2\nv3],b\nrow2,plain,c\n".getBytes(StandardCharsets.UTF_8);
+        byte[] data = "a,[v1\nv2\nv3],b".getBytes(StandardCharsets.UTF_8);
+        int boundary = reader.findLastRecordBoundary(data, data.length);
+        assertEquals("a,[v1\nv2\n".length() - 1, boundary);
+    }
+
+    public void testFindLastRecordBoundaryQuotedNewlineInsideBracketsIsRecordInternal() throws IOException {
+        // World 1 escape route: quote the multi-value cell to keep its \n record-internal. The
+        // last boundary is the \n after the closing quote, not the embedded one.
+        CsvFormatReader reader = newReader();
+        byte[] data = "a,\"[v1\nv2\nv3]\",b\nrow2,plain,c\n".getBytes(StandardCharsets.UTF_8);
         int boundary = reader.findLastRecordBoundary(data, data.length);
         assertEquals(data.length - 1, boundary);
     }

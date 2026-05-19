@@ -896,30 +896,28 @@ public class CsvFormatReader implements SegmentableFormatReader {
         );
     }
 
+    /**
+     * Record boundaries are quote-only (World 1, esql-planning#772). A newline only ends a record
+     * when it is outside a quoted field; brackets are never consulted here. A newline that must be
+     * part of a multi-value cell has to be quoted (RFC 4180, matching our own {@code CsvTestUtils}
+     * convention). The former bracket-comma MVC boundary scanner — which absorbed bare unquoted
+     * newlines inside {@code [...]} — was internally inconsistent (not quote-aware inside the
+     * bracket region, so {@code ["a]b"]} mis-parsed) and is removed. BWC: input relying on bare
+     * unquoted newlines inside {@code [...]} now splits at that newline; quote the cell instead.
+     */
     @Override
     public long findNextRecordBoundary(InputStream stream) throws IOException {
-        if (options.multiValueSyntax() != CsvFormatOptions.MultiValueSyntax.BRACKETS || options.delimiter() != ',') {
-            return findNextRecordBoundaryQuotedFieldsOnly(stream);
-        }
-        BufferedInputStream bis = stream instanceof BufferedInputStream b ? b : new BufferedInputStream(stream);
-        int markLimit = recordBoundaryMarkLimit();
-        long maxMvcSuffixBytes = Math.max(0L, markLimit - 1L);
-        return findNextRecordBoundaryBracketCommaMvc(bis, markLimit, maxMvcSuffixBytes);
+        return findNextRecordBoundaryQuotedFieldsOnly(stream);
     }
 
     /**
-     * Override the SPI default for the QuotedFieldsOnly path so the streaming segmentator gets a
-     * single-pass answer instead of dispatching the per-record scanner once per record.
-     * Bracket-comma MVC stays on the inherited default — its scanner has no per-call bulk
-     * allocation, and the bracket-region state machine (depth, leading-whitespace gating,
-     * mark limit) is non-trivial to fold into a single pass.
+     * Quote-only record boundary for the streaming segmentator, delegating to the
+     * {@link CsvBoundaryScanner.Impl} chosen at construction. World 1: brackets are a
+     * post-boundary field/element-split concern only and are not consulted here.
      */
     @Override
     public int findLastRecordBoundary(byte[] buf, int length) throws IOException {
-        if (options.multiValueSyntax() != CsvFormatOptions.MultiValueSyntax.BRACKETS || options.delimiter() != ',') {
-            return findLastRecordBoundaryQuotedFieldsOnly(buf, length);
-        }
-        return SegmentableFormatReader.super.findLastRecordBoundary(buf, length);
+        return findLastRecordBoundaryQuotedFieldsOnly(buf, length);
     }
 
     /**
@@ -939,129 +937,10 @@ public class CsvFormatReader implements SegmentableFormatReader {
     }
 
     /**
-     * Upper bound for {@link BufferedInputStream#mark(int)} while probing bracket MVC cells during record-boundary
-     * scans. Matches {@link CsvFormatOptions#maxFieldSize()} so an unclosed bracket cell cannot invalidate the mark
-     * before we reset and treat {@code [} as a literal byte.
-     */
-    private int recordBoundaryMarkLimit() {
-        int maxField = options.maxFieldSize();
-        if (maxField <= 0) {
-            return Math.min(64 * 1024 * 1024, Integer.MAX_VALUE - 8);
-        }
-        return Math.min(maxField + 1024, Integer.MAX_VALUE - 8);
-    }
-
-    /**
-     * Bytes consumed after an opening {@code [} until bracket depth returns to zero, or {@code -1} if EOF was reached
-     * first or the scan exceeded {@link CsvFormatOptions#maxFieldSize()} (unclosed cell).
-     */
-    private long consumeBracketMvcSuffixBytes(BufferedInputStream in, long maxSuffixBytes) throws IOException {
-        int depth = 1;
-        long bytes = 0;
-        while (depth > 0) {
-            if (bytes >= maxSuffixBytes) {
-                return -1;
-            }
-            int ib = in.read();
-            if (ib == -1) {
-                return -1;
-            }
-            bytes++;
-            byte b = (byte) ib;
-            if (b == '[') {
-                depth++;
-            } else if (b == ']') {
-                depth--;
-            }
-        }
-        return bytes;
-    }
-
-    private static boolean isAsciiCsvFieldLeadingWhitespace(int ib) {
-        return ib == ' ' || ib == '\t' || ib == '\f';
-    }
-
-    /**
-     * Record boundary scan for comma-delimited CSV with bracket MVC. Newlines inside {@code [..]} or quoted fields
-     * must not end the record. Quote opening follows RFC 4180 — only at field start, optionally preceded by whitespace
-     * — so stray {@code "} chars in unquoted cells do not trigger multi-line gluing or pathological segment splits.
-     */
-    private long findNextRecordBoundaryBracketCommaMvc(BufferedInputStream bis, int markLimit, long maxMvcSuffixBytes) throws IOException {
-        long consumed = 0;
-        boolean inQuotes = false;
-        boolean fieldHasNonWhitespace = false;
-        byte quoteAsByte = (byte) options.quoteChar();
-        byte escAsByte = (byte) options.escapeChar();
-        byte delimAsByte = (byte) options.delimiter();
-
-        while (true) {
-            int ib = bis.read();
-            if (ib == -1) {
-                return -1;
-            }
-            consumed++;
-            byte b = (byte) ib;
-
-            if (inQuotes) {
-                if (b == quoteAsByte) {
-                    bis.mark(2);
-                    int ib2 = bis.read();
-                    if (ib2 == -1) {
-                        inQuotes = false;
-                        continue;
-                    }
-                    if ((byte) ib2 == quoteAsByte) {
-                        consumed++;
-                        continue;
-                    }
-                    bis.reset();
-                    inQuotes = false;
-                } else if (b == escAsByte) {
-                    bis.mark(2);
-                    int ib2 = bis.read();
-                    if (ib2 != -1 && (byte) ib2 == delimAsByte) {
-                        consumed++;
-                        continue;
-                    }
-                    bis.reset();
-                }
-                continue;
-            }
-
-            if (b == '\n') {
-                return consumed;
-            }
-            if (b == delimAsByte) {
-                fieldHasNonWhitespace = false;
-                continue;
-            }
-            if (b == quoteAsByte && fieldHasNonWhitespace == false) {
-                inQuotes = true;
-                continue;
-            }
-            if (b == '[' && fieldHasNonWhitespace == false) {
-                bis.mark(markLimit);
-                long suffix = consumeBracketMvcSuffixBytes(bis, maxMvcSuffixBytes);
-                if (suffix >= 0) {
-                    consumed += suffix;
-                    fieldHasNonWhitespace = true;
-                    continue;
-                }
-                bis.reset();
-                fieldHasNonWhitespace = true;
-                continue;
-            }
-            if (isAsciiCsvFieldLeadingWhitespace(ib & 0xff) == false) {
-                fieldHasNonWhitespace = true;
-            }
-        }
-    }
-
-    /**
-     * Per-byte scan over a {@link BufferedInputStream} — no per-call bulk read buffer is allocated;
-     * an existing {@link BufferedInputStream} input is reused, otherwise the stream is wrapped once.
-     * Mirrors the structure of {@link #findNextRecordBoundaryBracketCommaMvc} for the no-bracket-MVC
-     * quoting contract.
+     * Per-byte forward record-boundary scan over a {@link BufferedInputStream} — no per-call bulk
+     * read buffer is allocated; an existing {@link BufferedInputStream} is reused, otherwise the
+     * stream is wrapped once. Quote-only (World 1): {@code quoteChar} toggles {@code inQuotes},
+     * a doubled quote is a literal, and a {@code \n} outside quotes terminates the record.
      */
     private long findNextRecordBoundaryQuotedFieldsOnly(InputStream stream) throws IOException {
         BufferedInputStream bis = stream instanceof BufferedInputStream b ? b : new BufferedInputStream(stream);
