@@ -95,6 +95,17 @@ public class NdJsonPageDecoder implements Closeable {
     private final ErrorPolicy errorPolicy;
     private final SkipWarnings skipWarnings;
     private long totalRowCount;
+
+    /**
+     * Positional fast-path decoder (elastic/esql-planning#710), or {@code null} when the projected
+     * schema isn't a flat set of supported scalar columns — in which case decoding uses Jackson only
+     * (unchanged behavior). Active only on the byte-array ({@link #sourceBytes}) path.
+     */
+    private final PositionalNdJsonDecoder positional;
+    /** Test/bench toggle to force the pure-Jackson path even when {@link #positional} is available. */
+    private boolean positionalEnabled = true;
+    /** Line cursor into {@link #sourceBytes} for the positional path; independent of {@link #parser}. */
+    private int positionalCursor;
     private long errorCount;
 
     /**
@@ -264,12 +275,50 @@ public class NdJsonPageDecoder implements Closeable {
         this.blockFactory = blockFactory;
         this.projectedAttributes = projectedAttributes;
         this.blockTracker = new BitSet(projectedAttributes.size());
+        this.positional = buildPositionalDecoder(projectedAttributes);
 
         if (sourceBytes != null) {
             this.parser = factory.createParser(sourceBytes, sourceOffset, sourceLength);
         } else {
             this.parser = factory.createParser(input);
         }
+        this.positionalCursor = parserSliceStart; // first line begins at the slice start
+    }
+
+    private static boolean positionalSupported(DataType t) {
+        return t == DataType.BOOLEAN
+            || t == DataType.INTEGER
+            || t == DataType.LONG
+            || t == DataType.DOUBLE
+            || t == DataType.KEYWORD
+            || t == DataType.DATETIME;
+    }
+
+    /**
+     * Build the positional decoder for {@code projected}, or return {@code null} if the projection
+     * isn't a flat list of supported scalar columns (nested/dotted names, an unsupported or NULL
+     * type, or a zero-column projection) — those keep the Jackson-only path.
+     */
+    private static PositionalNdJsonDecoder buildPositionalDecoder(List<Attribute> projected) {
+        if (projected.isEmpty()) {
+            return null;
+        }
+        String[] names = new String[projected.size()];
+        DataType[] types = new DataType[projected.size()];
+        for (int i = 0; i < projected.size(); i++) {
+            Attribute a = projected.get(i);
+            if (a.name().indexOf('.') >= 0 || positionalSupported(a.dataType()) == false) {
+                return null;
+            }
+            names[i] = a.name();
+            types[i] = a.dataType();
+        }
+        return new PositionalNdJsonDecoder(names, types);
+    }
+
+    // visible for testing/benchmarking: force the pure-Jackson path to compare against positional.
+    void setPositionalEnabled(boolean enabled) {
+        this.positionalEnabled = enabled;
     }
 
     private void recoverFromParseException(JsonParser failedParser) throws IOException {
@@ -371,10 +420,106 @@ public class NdJsonPageDecoder implements Closeable {
         // Setting up builders may trip the circuit breaker. Make sure they're all always closed
         try {
             decoder.setupBuilders(blockBuilders);
+            if (positional != null && positionalEnabled && sourceBytes != null) {
+                return decodePagePositional(blockBuilders);
+            }
             return errorPolicy.isStrict() ? decodePageFailFast(blockBuilders) : decodePageLenient(blockBuilders);
         } finally {
             Releasables.close(blockBuilders);
         }
+    }
+
+    /**
+     * Positional decode path (elastic/esql-planning#710): scan {@link #sourceBytes} line by line and
+     * decode each via {@link #positional}, falling back to Jackson per line for any shape the fast
+     * path doesn't cover. Each line decodes into per-line scratch builders and a row is committed
+     * only on full success, so a partial positional decode that bails mid-line cannot corrupt the
+     * page. The error policy is honored through the same {@link #onNdjsonLineParseError} machinery as
+     * the Jackson path (strict throws on a bad fallback line; lenient skips it).
+     */
+    private Page decodePagePositional(Block.Builder[] pageBuilders) throws IOException {
+        ensureLenientScratchBuffers();
+        final Block.Builder[] scratch = lenientScratchBuilders;
+        if (scratch == null) {
+            throw new EsqlIllegalArgumentException("scratch builders missing after ensureLenientScratchBuffers");
+        }
+        int lineCount = 0;
+        while (lineCount < batchSize && positionalCursor < sourceEnd) {
+            int start = positionalCursor;
+            int nl = start;
+            while (nl < sourceEnd && sourceBytes[nl] != '\n') {
+                nl++;
+            }
+            int contentEnd = (nl > start && sourceBytes[nl - 1] == '\r') ? nl - 1 : nl;
+            positionalCursor = (nl < sourceEnd) ? nl + 1 : sourceEnd;
+            if (isBlank(start, contentEnd)) {
+                continue; // blank / whitespace-only line between records
+            }
+            totalRowCount++;
+
+            // Fast path into scratch; commit only on full success.
+            blockTracker.clear();
+            decoder.setupBuilders(scratch);
+            boolean committed = false;
+            try {
+                if (positional.tryDecodeLine(sourceBytes, start, contentEnd, scratch, blockTracker)) {
+                    fillUntrackedNulls(scratch);
+                    appendDecodedScratchRow(pageBuilders, scratch);
+                    committed = true;
+                }
+            } finally {
+                Releasables.close(scratch);
+            }
+
+            if (committed == false) {
+                // Shape outside the fast path (array / nested object / escaped name / type mismatch):
+                // decode this one line with Jackson on fresh scratch, policy-aware on a parse error.
+                blockTracker.clear();
+                decoder.setupBuilders(scratch);
+                try (JsonParser lineParser = jsonFactory.createParser(sourceBytes, start, contentEnd - start)) {
+                    lineParser.nextToken(); // position at START_OBJECT
+                    decoder.decodeObject(lineParser, false);
+                    // A parser bounded to a single line treats end-of-slice as a clean object end, so an
+                    // unterminated object ({"a":1) or trailing content ({..}x) would be accepted here while
+                    // the streaming Jackson path rejects it. Require exactly one fully-closed object so the
+                    // fallback matches streaming semantics.
+                    if (lineParser.currentToken() != JsonToken.END_OBJECT || lineParser.nextToken() != null) {
+                        throw new JsonParseException(lineParser, "NDJSON line is not exactly one complete JSON object");
+                    }
+                    fillUntrackedNulls(scratch);
+                    appendDecodedScratchRow(pageBuilders, scratch);
+                    committed = true;
+                } catch (JsonParseException e) {
+                    onNdjsonLineParseError(e, totalRowCount, "decodeObject"); // strict throws; lenient skips
+                } finally {
+                    Releasables.close(scratch);
+                }
+            }
+
+            if (committed) {
+                lineCount++;
+            }
+        }
+        return buildPageFromBuildersOrNull(pageBuilders, lineCount);
+    }
+
+    private void fillUntrackedNulls(Block.Builder[] builders) {
+        for (int i = 0; i < builders.length; i++) {
+            if (blockTracker.get(i) == false) {
+                builders[i].appendNull();
+            }
+        }
+    }
+
+    /** Whether {@code sourceBytes[from, to)} is empty or only spaces/tabs (a blank line to skip). */
+    private boolean isBlank(int from, int to) {
+        for (int i = from; i < to; i++) {
+            byte b = sourceBytes[i];
+            if (b != ' ' && b != '\t') {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
