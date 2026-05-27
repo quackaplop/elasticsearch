@@ -73,6 +73,22 @@ public final class PositionalNdJsonDecoder {
     private byte[] strScratch = new byte[256];
     private final BytesRef scratchRef = new BytesRef();
 
+    // ---- per-line value slots (atomicity + speed) ----
+    // decodeValue writes the decoded value into these reusable per-column slots; flush() copies the
+    // slots into the page builders ONLY on a fully successful line. So a line that bails mid-decode
+    // appends nothing (never-corrupt invariant), AND the common success path appends straight to the
+    // page builders with no per-row scratch BlockBuilder churn (that churn made the wired path slower
+    // than Jackson — this is the fix). No per-row allocation: the arrays + byte buffer are reused.
+    private static final byte SLOT_UNSET = 0, SLOT_VALUE = 1, SLOT_NULL = 2;
+    private final byte[] slotState;
+    private final long[] longSlot;    // LONG + DATETIME (millis)
+    private final int[] intSlot;      // INTEGER
+    private final double[] dblSlot;   // DOUBLE
+    private final boolean[] boolSlot; // BOOLEAN
+    private final int[] strOff;       // KEYWORD: offset into strScratch
+    private final int[] strLen;       // KEYWORD: length in strScratch
+    private int strCursor;            // write position in strScratch, reset per line
+
     private int pos; // scan cursor, reset per line
 
     // ---- adaptive positional plan ----
@@ -128,6 +144,13 @@ public final class PositionalNdJsonDecoder {
         }
         this.orderLen = n;
         this.seen = new int[n];
+        this.slotState = new byte[n];
+        this.longSlot = new long[n];
+        this.intSlot = new int[n];
+        this.dblSlot = new double[n];
+        this.boolSlot = new boolean[n];
+        this.strOff = new int[n];
+        this.strLen = new int[n];
     }
 
     /**
@@ -150,6 +173,8 @@ public final class PositionalNdJsonDecoder {
         if (pos < to && buf[pos] == '}') {
             return true; // empty object (no projected fields; caller fills nulls)
         }
+        Arrays.fill(slotState, SLOT_UNSET); // reset per-line slots; values land here, flush on success
+        strCursor = 0;
         int oc = 0;        // cursor into `order` (the positional plan)
         int seenCount = 0; // projected columns resolved this line, in arrival order
         int fastHits = 0;  // resolved via the positional byte-compare rather than the hash
@@ -194,11 +219,10 @@ public final class PositionalNdJsonDecoder {
             } else {
                 col = lookup(buf, ns, nlen);
             }
-            if (decodeValue(buf, to, col, col == UNKNOWN ? null : builders[col]) == false) {
-                return false;
+            if (decodeValue(buf, to, col) == false) {
+                return false; // nothing flushed yet -> no partial append
             }
             if (col != UNKNOWN) {
-                touched.set(col);
                 if (seenCount < seen.length) {
                     seen[seenCount++] = col;
                 }
@@ -218,6 +242,7 @@ public final class PositionalNdJsonDecoder {
                 continue;
             }
             if (ch == '}') {
+                flush(builders, touched); // line fully decoded -> commit all slots to the page builders
                 adaptAfterLine(projected, fastHits, seenCount);
                 return true;
             }
@@ -269,8 +294,8 @@ public final class PositionalNdJsonDecoder {
         return Arrays.copyOf(order, orderLen);
     }
 
-    /** Decode the value at {@link #pos} into {@code builder} (or skip it if {@code col == UNKNOWN}). */
-    private boolean decodeValue(byte[] b, int to, int col, Block.Builder builder) {
+    /** Decode the value at {@link #pos} into the per-column slot {@code col} (or skip it if UNKNOWN). */
+    private boolean decodeValue(byte[] b, int to, int col) {
         byte c = b[pos];
         // Arrays and nested objects are out of fast-path scope.
         if (c == '[' || c == '{') {
@@ -281,11 +306,11 @@ public final class PositionalNdJsonDecoder {
                 return false;
             }
             pos += 4;
-            // Matches NdJsonPageDecoder: an explicit JSON null is appended inline (and the caller
-            // marks the column touched). Only fields ABSENT from the line are filled by the caller's
-            // end-of-line appendNull. A null for an unprojected column is simply skipped.
+            // An explicit JSON null is appended inline at flush (matches NdJsonPageDecoder); only
+            // fields ABSENT from the line are filled by the caller's end-of-line appendNull. A null
+            // for an unprojected column is simply skipped.
             if (col != UNKNOWN) {
-                builder.appendNull();
+                slotState[col] = SLOT_NULL;
             }
             return true;
         }
@@ -295,25 +320,24 @@ public final class PositionalNdJsonDecoder {
         DataType type = types[col];
         if (c == '"') {
             // String-shaped value. Valid for KEYWORD (raw/unescaped bytes) and DATETIME (parse to millis).
-            int valEnd = scanStringEnd(b, to); // pos left at opening quote+1 region via fields below
+            // scanStringEnd decodes into strScratch[strCursor, strCursor+lastStrLen).
+            int valEnd = scanStringEnd(b, to);
             if (valEnd < 0) {
                 return false;
             }
-            // strScratch[0..strLen) holds the unescaped UTF-8 bytes; pos advanced past closing quote.
-            int strLen = lastStrLen;
             switch (type) {
                 case KEYWORD -> {
-                    scratchRef.bytes = strScratch;
-                    scratchRef.offset = 0;
-                    scratchRef.length = strLen;
-                    ((BytesRefBlock.Builder) builder).appendBytesRef(scratchRef);
+                    strOff[col] = strCursor;
+                    strLen[col] = lastStrLen;
+                    strCursor += lastStrLen; // keep this keyword's bytes for flush; the next appends after
+                    slotState[col] = SLOT_VALUE;
                     return true;
                 }
                 case DATETIME -> {
                     try {
-                        String s = new String(strScratch, 0, strLen, StandardCharsets.UTF_8);
-                        long millis = NdJsonSchemaInferrer.DATE_FORMATTER.parseMillis(s);
-                        ((LongBlock.Builder) builder).appendLong(millis);
+                        String s = new String(strScratch, strCursor, lastStrLen, StandardCharsets.UTF_8);
+                        longSlot[col] = NdJsonSchemaInferrer.DATE_FORMATTER.parseMillis(s);
+                        slotState[col] = SLOT_VALUE;
                         return true;
                     } catch (Exception e) {
                         return false; // unparseable date -> Jackson's lenient path decides
@@ -330,12 +354,14 @@ public final class PositionalNdJsonDecoder {
             }
             if (c == 't' && regionEquals(b, to, "true")) {
                 pos += 4;
-                ((BooleanBlock.Builder) builder).appendBoolean(true);
+                boolSlot[col] = true;
+                slotState[col] = SLOT_VALUE;
                 return true;
             }
             if (c == 'f' && regionEquals(b, to, "false")) {
                 pos += 5;
-                ((BooleanBlock.Builder) builder).appendBoolean(false);
+                boolSlot[col] = false;
+                slotState[col] = SLOT_VALUE;
                 return true;
             }
             return false;
@@ -360,7 +386,8 @@ public final class PositionalNdJsonDecoder {
                 if (numberOverflow || v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) {
                     return false; // out of int range -> let Jackson's coercion rules decide
                 }
-                ((IntBlock.Builder) builder).appendInt((int) v);
+                intSlot[col] = (int) v;
+                slotState[col] = SLOT_VALUE;
                 return true;
             }
             case LONG -> {
@@ -371,14 +398,15 @@ public final class PositionalNdJsonDecoder {
                 if (numberOverflow) {
                     return false; // out of long range -> defer to Jackson
                 }
-                ((LongBlock.Builder) builder).appendLong(v);
+                longSlot[col] = v;
+                slotState[col] = SLOT_VALUE;
                 return true;
             }
             case DOUBLE -> {
                 // Token is canonical JSON (kind 1 or 2); the JDK parser then matches Jackson's value.
                 try {
-                    double d = Double.parseDouble(new String(b, numStart, numEnd - numStart, StandardCharsets.US_ASCII));
-                    ((DoubleBlock.Builder) builder).appendDouble(d);
+                    dblSlot[col] = Double.parseDouble(new String(b, numStart, numEnd - numStart, StandardCharsets.US_ASCII));
+                    slotState[col] = SLOT_VALUE;
                     return true;
                 } catch (NumberFormatException e) {
                     return false;
@@ -386,6 +414,38 @@ public final class PositionalNdJsonDecoder {
             }
             default -> {
                 return false; // number for a string/boolean column -> coercion, punt
+            }
+        }
+    }
+
+    /**
+     * Commit the per-line slots to the page builders. Called only after a fully-decoded line, so it
+     * never appends a partial row. Sets {@code touched} for every column it writes; columns left
+     * {@link #SLOT_UNSET} (absent from the line) are filled by the caller's end-of-line appendNull.
+     */
+    private void flush(Block.Builder[] builders, java.util.BitSet touched) {
+        for (int c = 0; c < types.length; c++) {
+            byte st = slotState[c];
+            if (st == SLOT_UNSET) {
+                continue;
+            }
+            touched.set(c);
+            if (st == SLOT_NULL) {
+                builders[c].appendNull();
+                continue;
+            }
+            switch (types[c]) {
+                case LONG, DATETIME -> ((LongBlock.Builder) builders[c]).appendLong(longSlot[c]);
+                case INTEGER -> ((IntBlock.Builder) builders[c]).appendInt(intSlot[c]);
+                case DOUBLE -> ((DoubleBlock.Builder) builders[c]).appendDouble(dblSlot[c]);
+                case BOOLEAN -> ((BooleanBlock.Builder) builders[c]).appendBoolean(boolSlot[c]);
+                case KEYWORD -> {
+                    scratchRef.bytes = strScratch;
+                    scratchRef.offset = strOff[c];
+                    scratchRef.length = strLen[c];
+                    ((BytesRefBlock.Builder) builders[c]).appendBytesRef(scratchRef);
+                }
+                default -> throw new IllegalStateException("unsupported positional slot type: " + types[c]);
             }
         }
     }
@@ -482,13 +542,13 @@ public final class PositionalNdJsonDecoder {
      * @return the index just after the closing quote, or {@code -1} if malformed.
      */
     private int scanStringEnd(byte[] b, int to) {
-        int i = pos + 1; // past opening quote
-        int out = 0;
+        int i = pos + 1;       // past opening quote
+        int out = strCursor;   // decode into strScratch starting at the per-line cursor (not 0)
         byte[] scratch = strScratch;
         while (i < to) {
             byte ch = b[i];
             if (ch == '"') {
-                lastStrLen = out;
+                lastStrLen = out - strCursor;
                 strScratch = scratch;
                 pos = i + 1;
                 return pos;

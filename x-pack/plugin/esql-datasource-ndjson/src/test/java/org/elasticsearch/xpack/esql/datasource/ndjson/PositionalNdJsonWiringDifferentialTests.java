@@ -101,6 +101,58 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
         assertWiringMatchesJackson(doc.toByteArray(), randomFrom(1, 4, 1024), ErrorPolicy.LENIENT);
     }
 
+    /**
+     * Heavy fuzz of the hand-rolled UTF-8 / string-content validation against Jackson. Each iteration
+     * builds a single {@code {"c_name":"<random bytes>"}} line whose value is an adversarial mix of
+     * valid code points (incl. boundary + astral), lone continuation bytes, invalid leads, truncated
+     * and overlong sequences, surrogate ranges, control chars and raw garbage. Positional must decode
+     * exactly what Jackson decodes or defer to it (single-line docs avoid lenient over-consume recovery
+     * differences), and must never throw. Thousands of cases per run, seed-reproducible.
+     */
+    public void testUtf8StringContentFuzzMatchesJackson() throws IOException {
+        int iterations = scaledRandomIntBetween(2000, 20000);
+        for (int it = 0; it < iterations; it++) {
+            java.io.ByteArrayOutputStream line = new java.io.ByteArrayOutputStream();
+            appendUtf8(line, "{\"a_long\":7,\"c_name\":\"");
+            appendRandomStringContent(line);
+            appendUtf8(line, "\"}\n");
+            assertWiringMatchesJackson(line.toByteArray(), randomFrom(1, 1024), ErrorPolicy.LENIENT);
+        }
+    }
+
+    /** Append an adversarial byte mix to a JSON string value (no raw newline, which would split the line). */
+    private void appendRandomStringContent(java.io.ByteArrayOutputStream out) {
+        int parts = randomInt(10);
+        for (int i = 0; i < parts; i++) {
+            switch (randomInt(7)) {
+                case 0, 1 -> { // valid code point (weighted common): exercises the accept path incl. multi-byte
+                    byte[] u = new String(Character.toChars(randomValidCodePoint())).getBytes(StandardCharsets.UTF_8);
+                    out.write(u, 0, u.length);
+                }
+                case 2 -> out.write(0x80 + randomInt(0x40));                       // lone continuation byte
+                case 3 -> out.write(randomFrom(0xC0, 0xC1, 0xF5, 0xF6, 0xFE, 0xFF)); // always-invalid lead byte
+                case 4 -> out.write(0xC2 + randomInt(0x1E));                       // multi-byte lead (often truncated)
+                case 5 -> writeNonNewline(out, randomInt(0x20));                   // control character
+                default -> writeNonNewline(out, randomInt(0x100));                 // raw byte
+            }
+        }
+    }
+
+    private static void writeNonNewline(java.io.ByteArrayOutputStream out, int b) {
+        if (b != '\n' && b != '\r') { // a raw newline would split the line; line-splitting isn't under test here
+            out.write(b);
+        }
+    }
+
+    private int randomValidCodePoint() {
+        while (true) {
+            int cp = randomIntBetween(0x20, 0x10FFFF); // printable range
+            if (cp < 0xD800 || cp > 0xDFFF) {          // exclude UTF-16 surrogates (not valid scalar values)
+                return cp;
+            }
+        }
+    }
+
     /** A {@code c_name} string line with {@code rawByte} embedded mid-value — a byte Jackson rejects. */
     private void appendBadStringLine(java.io.ByteArrayOutputStream doc, int rawByte) {
         appendUtf8(doc, "{\"c_name\":\"a");

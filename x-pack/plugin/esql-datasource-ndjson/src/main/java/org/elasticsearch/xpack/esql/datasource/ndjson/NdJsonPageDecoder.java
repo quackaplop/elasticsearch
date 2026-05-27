@@ -112,6 +112,12 @@ public class NdJsonPageDecoder implements Closeable {
     private boolean positionalEnabled = false;
     /** Line cursor into {@link #sourceBytes} for the positional path; independent of {@link #parser}. */
     private int positionalCursor;
+    // Fallback-rate give-up: if most lines aren't fast-path eligible (e.g. array-heavy NDJSON), the
+    // per-line Jackson fallback is slower than streaming, so we re-point the streaming parser at the
+    // current position and run the rest of the read on the Jackson path.
+    private int positionalAttempts;
+    private int positionalFallbacks;
+    private static final int POSITIONAL_GIVEUP_MIN_LINES = 64;
     private long errorCount;
 
     /**
@@ -473,11 +479,6 @@ public class NdJsonPageDecoder implements Closeable {
      * the Jackson path (strict throws on a bad fallback line; lenient skips it).
      */
     private Page decodePagePositional(Block.Builder[] pageBuilders) throws IOException {
-        ensureLenientScratchBuffers();
-        final Block.Builder[] scratch = lenientScratchBuilders;
-        if (scratch == null) {
-            throw new EsqlIllegalArgumentException("scratch builders missing after ensureLenientScratchBuffers");
-        }
         int lineCount = 0;
         while (lineCount < batchSize && positionalCursor < sourceEnd) {
             int start = positionalCursor;
@@ -492,50 +493,92 @@ public class NdJsonPageDecoder implements Closeable {
             }
             totalRowCount++;
 
-            // Fast path into scratch; commit only on full success.
+            // Positional fast path appends straight to the page builders — no per-row scratch. It is
+            // atomic: tryDecodeLine flushes its per-line slots only on full success, so a mid-line bail
+            // appends nothing and we fall back cleanly.
             blockTracker.clear();
-            decoder.setupBuilders(scratch);
-            boolean committed = false;
-            try {
-                if (positional.tryDecodeLine(sourceBytes, start, contentEnd, scratch, blockTracker)) {
-                    fillUntrackedNulls(scratch);
-                    appendDecodedScratchRow(pageBuilders, scratch);
-                    committed = true;
-                }
-            } finally {
-                Releasables.close(scratch);
-            }
-
-            if (committed == false) {
-                // Shape outside the fast path (array / nested object / escaped name / type mismatch):
-                // decode this one line with Jackson on fresh scratch, policy-aware on a parse error.
-                blockTracker.clear();
-                decoder.setupBuilders(scratch);
-                try (JsonParser lineParser = jsonFactory.createParser(sourceBytes, start, contentEnd - start)) {
-                    lineParser.nextToken(); // position at START_OBJECT
-                    decoder.decodeObject(lineParser, false);
-                    // A parser bounded to a single line treats end-of-slice as a clean object end, so an
-                    // unterminated object ({"a":1) or trailing content ({..}x) would be accepted here while
-                    // the streaming Jackson path rejects it. Require exactly one fully-closed object so the
-                    // fallback matches streaming semantics.
-                    if (lineParser.currentToken() != JsonToken.END_OBJECT || lineParser.nextToken() != null) {
-                        throw new JsonParseException(lineParser, "NDJSON line is not exactly one complete JSON object");
-                    }
-                    fillUntrackedNulls(scratch);
-                    appendDecodedScratchRow(pageBuilders, scratch);
-                    committed = true;
-                } catch (JsonParseException e) {
-                    onNdjsonLineParseError(e, totalRowCount, "decodeObject"); // strict throws; lenient skips
-                } finally {
-                    Releasables.close(scratch);
-                }
-            }
-
-            if (committed) {
+            boolean fellBack;
+            if (positional.tryDecodeLine(sourceBytes, start, contentEnd, pageBuilders, blockTracker)) {
+                fillUntrackedNulls(pageBuilders);
                 lineCount++;
+                fellBack = false;
+            } else {
+                // Shape outside the fast path (array / nested object / escaped name / type mismatch /
+                // malformed): hand this single line to Jackson, honoring the error policy.
+                if (decodeFallbackLine(pageBuilders, start, contentEnd)) {
+                    lineCount++;
+                }
+                fellBack = true;
+            }
+
+            positionalAttempts++;
+            if (fellBack) {
+                positionalFallbacks++;
+            }
+            if (positionalAttempts >= POSITIONAL_GIVEUP_MIN_LINES && positionalFallbacks * 2 > positionalAttempts) {
+                // Most lines aren't fast-path eligible: the per-line fallback is slower than streaming.
+                // Re-point the streaming parser at the current position and run the rest on the Jackson path.
+                parser.close();
+                parser = jsonFactory.createParser(sourceBytes, positionalCursor, sourceEnd - positionalCursor);
+                parserSliceStart = positionalCursor;
+                positionalEnabled = false;
+                break;
             }
         }
         return buildPageFromBuildersOrNull(pageBuilders, lineCount);
+    }
+
+    /**
+     * Decode one line the positional path could not handle, via Jackson. STRICT appends directly to the
+     * page builders (a parse error aborts the whole page, so a partial row is moot); LENIENT decodes into
+     * scratch and commits only on success so a skipped bad row never partially appends. Returns whether a
+     * row was committed (always {@code true} on the strict success path; strict errors throw).
+     */
+    private boolean decodeFallbackLine(Block.Builder[] pageBuilders, int start, int contentEnd) throws IOException {
+        blockTracker.clear();
+        if (errorPolicy.isStrict()) {
+            // The decoder tree's builders point at pageBuilders (set in decodePage); decodeObject appends there.
+            try (JsonParser lineParser = jsonFactory.createParser(sourceBytes, start, contentEnd - start)) {
+                lineParser.nextToken(); // START_OBJECT
+                decoder.decodeObject(lineParser, false);
+                requireSingleObject(lineParser);
+                fillUntrackedNulls(pageBuilders);
+                return true;
+            } catch (JsonParseException e) {
+                onNdjsonLineParseError(e, totalRowCount, "decodeObject"); // strict: re-throws (formatted)
+                return false; // unreachable on strict (above threw); satisfies the compiler
+            }
+        }
+        ensureLenientScratchBuffers();
+        final Block.Builder[] scratch = lenientScratchBuilders;
+        if (scratch == null) {
+            throw new EsqlIllegalArgumentException("scratch builders missing after ensureLenientScratchBuffers");
+        }
+        decoder.setupBuilders(scratch);
+        try (JsonParser lineParser = jsonFactory.createParser(sourceBytes, start, contentEnd - start)) {
+            lineParser.nextToken();
+            decoder.decodeObject(lineParser, false);
+            requireSingleObject(lineParser);
+            fillUntrackedNulls(scratch);
+            appendDecodedScratchRow(pageBuilders, scratch);
+            return true;
+        } catch (JsonParseException e) {
+            onNdjsonLineParseError(e, totalRowCount, "decodeObject"); // lenient: record + skip
+            return false;
+        } finally {
+            Releasables.close(scratch);
+        }
+    }
+
+    /**
+     * A parser bounded to a single line treats end-of-slice as a clean object end, so an unterminated
+     * object or trailing content after the closing brace would be accepted while the streaming Jackson
+     * path rejects it. Require exactly one fully-closed object so the fallback matches streaming.
+     */
+    private static void requireSingleObject(JsonParser lineParser) throws IOException {
+        if (lineParser.currentToken() != JsonToken.END_OBJECT || lineParser.nextToken() != null) {
+            throw new JsonParseException(lineParser, "NDJSON line is not exactly one complete JSON object");
+        }
     }
 
     private void fillUntrackedNulls(Block.Builder[] builders) {
