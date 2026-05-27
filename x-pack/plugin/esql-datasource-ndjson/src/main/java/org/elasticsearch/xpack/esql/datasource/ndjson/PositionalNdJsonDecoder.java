@@ -30,10 +30,10 @@ import java.util.Arrays;
  * shape: a flat object of scalar fields ({@code long}/{@code int}/{@code double}/{@code boolean}/
  * keyword/{@code datetime}/{@code null}), fields in any order. Anything outside that — arrays,
  * nested objects, or a value whose shape doesn't match the column's declared type — makes
- * {@link #tryDecodeLine} return {@code false} so the caller falls
- * back to Jackson for that single line ({@link NdJsonPageDecoder}'s long-tail path). Wiring this
- * into the live decode loop is deferred until the in-flight aggregate-metadata-pushdown work
- * (elastic/elasticsearch#149380) merges, since both touch {@link NdJsonPageDecoder}.
+ * {@link #tryDecodeLine} return {@code false} so the caller falls back to Jackson for that single
+ * line ({@link NdJsonPageDecoder}'s long-tail path). Wired into {@link NdJsonPageDecoder}'s
+ * byte-array decode path behind the {@code esql.datasource.ndjson.positional_decoding} node setting
+ * (opt-in, default off): when disabled the reader is pure Jackson, unchanged.
  *
  * <p>Not thread-safe: one instance per consumer (it owns mutable scan + unescape scratch).
  */
@@ -41,6 +41,22 @@ public final class PositionalNdJsonDecoder {
 
     /** Sentinel returned by {@link #lookup} for a field name not in the projected schema. */
     private static final int UNKNOWN = -1;
+
+    // String-scanner byte/codepoint constants (Unicode well-formed UTF-8 byte ranges + surrogate bounds).
+    private static final int CONTROL_CHAR_LIMIT = 0x20; // bytes below this are JSON control chars (must be escaped)
+    private static final int ASCII_LIMIT = 0x80;        // bytes below this are single-byte ASCII
+    private static final int UTF8_CONT_MIN = 0x80, UTF8_CONT_MAX = 0xBF; // continuation byte range
+    private static final int UTF8_LEAD_2B_MIN = 0xC2, UTF8_LEAD_2B_MAX = 0xDF;
+    private static final int UTF8_LEAD_3B_MIN = 0xE0, UTF8_LEAD_3B_MAX = 0xEF;
+    private static final int UTF8_LEAD_4B_MIN = 0xF0, UTF8_LEAD_4B_MAX = 0xF4;
+    private static final int UTF8_LEAD_E0 = 0xE0, UTF8_LEAD_ED = 0xED, UTF8_LEAD_F0 = 0xF0, UTF8_LEAD_F4 = 0xF4;
+    private static final int UTF8_E0_MIN_2ND = 0xA0; // E0 lead: 2nd byte >= A0 rejects overlong encodings
+    private static final int UTF8_ED_MAX_2ND = 0x9F; // ED lead: 2nd byte <= 9F rejects UTF-16 surrogates
+    private static final int UTF8_F0_MIN_2ND = 0x90; // F0 lead: 2nd byte >= 90 rejects overlong encodings
+    private static final int UTF8_F4_MAX_2ND = 0x8F; // F4 lead: 2nd byte <= 8F rejects code points > U+10FFFF
+    private static final int HIGH_SURROGATE_MIN = 0xD800, HIGH_SURROGATE_MAX = 0xDBFF;
+    private static final int LOW_SURROGATE_MIN = 0xDC00, LOW_SURROGATE_MAX = 0xDFFF;
+    private static final int SUPPLEMENTARY_BASE = 0x10000;
 
     private final DataType[] types;
 
@@ -324,40 +340,48 @@ public final class PositionalNdJsonDecoder {
             }
             return false;
         }
-        // number
+        // number. Validate the token is a CANONICAL JSON number before accepting; defer to Jackson on
+        // anything non-canonical (leading zeros, leading '+', lone '-', trailing junk, ".5", "1.",
+        // bad exponent), since Jackson rejects those and the fast path must never accept what Jackson
+        // would reject. classify: 0 = invalid, 1 = integer, 2 = decimal.
         int numStart = pos;
-        boolean fractional = scanNumber(b, to);
+        scanNumber(b, to);
         int numEnd = pos;
-        if (numEnd == numStart) {
-            return false; // a value was expected but there's no number here (malformed) -> let Jackson decide
+        int kind = classifyJsonNumber(b, numStart, numEnd);
+        if (kind == 0) {
+            return false;
         }
         switch (type) {
             case INTEGER -> {
-                if (fractional) {
-                    return false;
+                if (kind != 1) {
+                    return false; // a fractional/exponent token is not an integer column value
                 }
-                long v = parseLong(b, numStart, numEnd);
-                if (v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) {
-                    return false; // coercion overflow -> Jackson path
+                long v = parseLongChecked(b, numStart, numEnd);
+                if (numberOverflow || v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) {
+                    return false; // out of int range -> let Jackson's coercion rules decide
                 }
                 ((IntBlock.Builder) builder).appendInt((int) v);
                 return true;
             }
             case LONG -> {
-                if (fractional) {
+                if (kind != 1) {
                     return false;
                 }
-                ((LongBlock.Builder) builder).appendLong(parseLong(b, numStart, numEnd));
+                long v = parseLongChecked(b, numStart, numEnd);
+                if (numberOverflow) {
+                    return false; // out of long range -> defer to Jackson
+                }
+                ((LongBlock.Builder) builder).appendLong(v);
                 return true;
             }
             case DOUBLE -> {
-                // Use the JDK parser on the exact token so the value matches Jackson bit-for-bit.
+                // Token is canonical JSON (kind 1 or 2); the JDK parser then matches Jackson's value.
                 try {
                     double d = Double.parseDouble(new String(b, numStart, numEnd - numStart, StandardCharsets.US_ASCII));
                     ((DoubleBlock.Builder) builder).appendDouble(d);
                     return true;
                 } catch (NumberFormatException e) {
-                    return false; // malformed number -> defer to Jackson rather than fabricate or throw
+                    return false;
                 }
             }
             default -> {
@@ -366,9 +390,90 @@ public final class PositionalNdJsonDecoder {
         }
     }
 
+    /**
+     * Classify {@code b[s, e)} against the strict JSON number grammar
+     * {@code -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?}: returns 0 (not a canonical JSON number),
+     * 1 (integer), or 2 (decimal). Rejects leading zeros, a leading {@code +}, a lone {@code -},
+     * {@code .5}, {@code 1.}, bad/empty exponents, and any trailing bytes — all of which Jackson rejects.
+     */
+    private static int classifyJsonNumber(byte[] b, int s, int e) {
+        int i = s;
+        if (i < e && b[i] == '-') {
+            i++;
+        }
+        if (i >= e) {
+            return 0;
+        }
+        if (b[i] == '0') {
+            i++; // a leading zero must stand alone (no "00", "07")
+        } else if (b[i] >= '1' && b[i] <= '9') {
+            while (i < e && b[i] >= '0' && b[i] <= '9') {
+                i++;
+            }
+        } else {
+            return 0;
+        }
+        boolean decimal = false;
+        if (i < e && b[i] == '.') {
+            decimal = true;
+            i++;
+            int d = i;
+            while (i < e && b[i] >= '0' && b[i] <= '9') {
+                i++;
+            }
+            if (i == d) {
+                return 0; // '.' with no following digit
+            }
+        }
+        if (i < e && (b[i] == 'e' || b[i] == 'E')) {
+            decimal = true;
+            i++;
+            if (i < e && (b[i] == '+' || b[i] == '-')) {
+                i++;
+            }
+            int d = i;
+            while (i < e && b[i] >= '0' && b[i] <= '9') {
+                i++;
+            }
+            if (i == d) {
+                return 0; // exponent with no digits
+            }
+        }
+        if (i != e) {
+            return 0; // trailing bytes after a complete number
+        }
+        return decimal ? 2 : 1;
+    }
+
+    /**
+     * Parse a canonical-integer token (validated by {@link #classifyJsonNumber}) with overflow
+     * detection. Accumulates in negative space so {@code Long.MIN_VALUE} parses exactly; on any
+     * over/underflow sets {@link #numberOverflow} (the caller then defers to Jackson).
+     */
+    private long parseLongChecked(byte[] b, int from, int to) {
+        numberOverflow = false;
+        int i = from;
+        boolean neg = b[i] == '-';
+        if (neg) {
+            i++;
+        }
+        long v = 0;
+        try {
+            while (i < to) {
+                v = Math.subtractExact(Math.multiplyExact(v, 10), b[i] - '0');
+                i++;
+            }
+            return neg ? v : Math.negateExact(v);
+        } catch (ArithmeticException overflow) {
+            numberOverflow = true;
+            return 0;
+        }
+    }
+
     // ---- scanning helpers (operate on the instance cursor `pos`) ----
 
     private int lastStrLen;
+    private boolean numberOverflow; // set by parseLongChecked when an integer token exceeds long range
 
     /**
      * Decode the JSON string starting at {@link #pos} (the opening quote) into {@link #strScratch},
@@ -413,16 +518,18 @@ public final class PositionalNdJsonDecoder {
                             return -1;
                         }
                         i += 4;
-                        if (u >= 0xD800 && u <= 0xDBFF) { // high surrogate -> expect a low-surrogate escape next
+                        if (u >= HIGH_SURROGATE_MIN && u <= HIGH_SURROGATE_MAX) { // expect a low-surrogate escape next
                             if (i + 6 > to || b[i] != '\\' || b[i + 1] != 'u') {
                                 return -1;
                             }
                             int lo = hex4(b, i + 2);
-                            if (lo < 0xDC00 || lo > 0xDFFF) {
+                            if (lo < LOW_SURROGATE_MIN || lo > LOW_SURROGATE_MAX) {
                                 return -1;
                             }
                             i += 6;
-                            cp = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                            cp = SUPPLEMENTARY_BASE + ((u - HIGH_SURROGATE_MIN) << 10) + (lo - LOW_SURROGATE_MIN);
+                        } else if (u >= LOW_SURROGATE_MIN && u <= LOW_SURROGATE_MAX) {
+                            return -1; // lone low surrogate -> invalid, defer to Jackson
                         } else {
                             cp = u;
                         }
@@ -435,12 +542,64 @@ public final class PositionalNdJsonDecoder {
                 out = appendUtf8(scratch, out, cp);
                 continue;
             }
-            // raw byte (already UTF-8 on the wire)
-            scratch = ensure(scratch, out + 1);
-            scratch[out++] = ch;
-            i++;
+            // Raw (unescaped) byte. JSON forbids unescaped control characters, and Jackson validates
+            // UTF-8 — so the fast path must too, or it would copy bytes Jackson rejects. Determine the
+            // UTF-8 sequence length from the lead byte, validate it, and copy it verbatim; defer on
+            // anything not well-formed (accepts valid multi-byte text such as Cyrillic, rejects junk).
+            int c = ch & 0xFF;
+            if (c < CONTROL_CHAR_LIMIT) {
+                return -1; // unescaped control character
+            }
+            int seqLen;
+            if (c < ASCII_LIMIT) {
+                seqLen = 1;
+            } else if (c >= UTF8_LEAD_2B_MIN && c <= UTF8_LEAD_2B_MAX) {
+                seqLen = 2;
+            } else if (c >= UTF8_LEAD_3B_MIN && c <= UTF8_LEAD_3B_MAX) {
+                seqLen = 3;
+            } else if (c >= UTF8_LEAD_4B_MIN && c <= UTF8_LEAD_4B_MAX) {
+                seqLen = 4;
+            } else {
+                return -1; // invalid lead byte (0x80-0xC1 continuation/overlong, 0xF5-0xFF out of range)
+            }
+            if (i + seqLen > to || (seqLen > 1 && validUtf8Tail(b, i, seqLen) == false)) {
+                return -1;
+            }
+            scratch = ensure(scratch, out + seqLen);
+            for (int k = 0; k < seqLen; k++) {
+                scratch[out++] = b[i + k];
+            }
+            i += seqLen;
         }
         return -1; // unterminated
+    }
+
+    /** Validate the continuation bytes of a multi-byte UTF-8 sequence (Unicode well-formed byte ranges). */
+    private static boolean validUtf8Tail(byte[] b, int i, int seqLen) {
+        int b0 = b[i] & 0xFF;
+        int b1 = b[i + 1] & 0xFF;
+        if (seqLen == 2) {
+            return isCont(b1);
+        }
+        if (seqLen == 3) {
+            if (b0 == UTF8_LEAD_E0 ? (b1 < UTF8_E0_MIN_2ND || b1 > UTF8_CONT_MAX)
+                : b0 == UTF8_LEAD_ED ? (b1 < UTF8_CONT_MIN || b1 > UTF8_ED_MAX_2ND)
+                : isCont(b1) == false) {
+                return false;
+            }
+            return isCont(b[i + 2] & 0xFF);
+        }
+        // seqLen == 4
+        if (b0 == UTF8_LEAD_F0 ? (b1 < UTF8_F0_MIN_2ND || b1 > UTF8_CONT_MAX)
+            : b0 == UTF8_LEAD_F4 ? (b1 < UTF8_CONT_MIN || b1 > UTF8_F4_MAX_2ND)
+            : isCont(b1) == false) {
+            return false;
+        }
+        return isCont(b[i + 2] & 0xFF) && isCont(b[i + 3] & 0xFF);
+    }
+
+    private static boolean isCont(int v) {
+        return v >= UTF8_CONT_MIN && v <= UTF8_CONT_MAX;
     }
 
     private byte[] ensure(byte[] a, int need) {
@@ -525,22 +684,6 @@ public final class PositionalNdJsonDecoder {
             }
         }
         return fractional;
-    }
-
-    private static long parseLong(byte[] b, int from, int to) {
-        int i = from;
-        boolean neg = false;
-        if (b[i] == '-') {
-            neg = true;
-            i++;
-        } else if (b[i] == '+') {
-            i++;
-        }
-        long v = 0;
-        while (i < to) {
-            v = v * 10 + (b[i++] - '0');
-        }
-        return neg ? -v : v;
     }
 
     private void skipWs(byte[] b, int to) {

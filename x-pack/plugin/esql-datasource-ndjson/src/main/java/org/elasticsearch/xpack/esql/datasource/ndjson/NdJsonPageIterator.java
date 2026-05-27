@@ -62,7 +62,8 @@ final class NdJsonPageIterator implements CloseableIterator<Page> {
         boolean trimLastPartialLine,
         List<Attribute> resolvedAttributes,
         ErrorPolicy errorPolicy,
-        NdJsonReaderCounters counters
+        NdJsonReaderCounters counters,
+        boolean positionalDecoding
     ) throws IOException {
         Check.isTrue(errorPolicy != null, "errorPolicy must not be null");
         Check.isTrue(counters != null, "counters must not be null");
@@ -104,6 +105,7 @@ final class NdJsonPageIterator implements CloseableIterator<Page> {
                 counters
             );
         }
+        this.pageDecoder.setPositionalEnabled(positionalDecoding);
     }
 
     /**

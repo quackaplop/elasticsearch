@@ -35,12 +35,7 @@ public class PositionalNdJsonDecoderTests extends ESTestCase {
     private final BlockFactory factory = new BlockFactory(new NoopCircuitBreaker("test"), BigArrays.NON_RECYCLING_INSTANCE);
 
     private static final String[] NAMES = { "id", "count", "name", "ratio", "flag" };
-    private static final DataType[] TYPES = {
-        DataType.LONG,
-        DataType.INTEGER,
-        DataType.KEYWORD,
-        DataType.DOUBLE,
-        DataType.BOOLEAN };
+    private static final DataType[] TYPES = { DataType.LONG, DataType.INTEGER, DataType.KEYWORD, DataType.DOUBLE, DataType.BOOLEAN };
 
     public void testScalarRowMatchesExpected() {
         decodeOne("{\"id\":42,\"count\":7,\"name\":\"hello\",\"ratio\":3.5,\"flag\":true}", row -> {
@@ -67,7 +62,12 @@ public class PositionalNdJsonDecoderTests extends ESTestCase {
         // lexer runs the unicode-escape pass over the raw source, even inside string literals).
         String bsu = "\\" + "u"; // a literal backslash followed by 'u'
         String json = "{\"id\":1,\"count\":1,\"name\":\"a\\\"b\\\\c\\n\\t"
-            + bsu + "00e9" + bsu + "D83D" + bsu + "DE00\",\"ratio\":1.0,\"flag\":true}";
+            + bsu
+            + "00e9"
+            + bsu
+            + "D83D"
+            + bsu
+            + "DE00\",\"ratio\":1.0,\"flag\":true}";
         String expected = "a\"b\\c\n\té😀"; // what Jackson's getValueAsString() would yield
         decodeOne(json, row -> assertEquals(new BytesRef(expected.getBytes(StandardCharsets.UTF_8)), row.bytesAt(2)));
     }
@@ -163,12 +163,7 @@ public class PositionalNdJsonDecoderTests extends ESTestCase {
         String name = "n" + r;
         double ratio = r + 0.5;
         boolean flag = (r & 1) == 0;
-        String[] frag = {
-            "\"id\":" + id,
-            "\"count\":" + count,
-            "\"name\":\"" + name + "\"",
-            "\"ratio\":" + ratio,
-            "\"flag\":" + flag };
+        String[] frag = { "\"id\":" + id, "\"count\":" + count, "\"name\":\"" + name + "\"", "\"ratio\":" + ratio, "\"flag\":" + flag };
         StringBuilder sb = new StringBuilder("{");
         for (int j = 0; j < fieldOrder.length; j++) {
             if (j > 0) {

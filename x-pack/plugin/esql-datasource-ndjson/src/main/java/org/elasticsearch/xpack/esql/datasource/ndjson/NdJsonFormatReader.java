@@ -48,6 +48,14 @@ public class NdJsonFormatReader implements SegmentableFormatReader {
     public static final int DEFAULT_SCHEMA_SAMPLE_SIZE = 20_000;
 
     /**
+     * Node-level opt-in for the schema-positional NDJSON decode fast path (elastic/esql-planning#710).
+     * Default {@code false}: the reader uses Jackson exactly as before unless this is turned on, so the
+     * path can be enabled for benchmarking/canary and instantly disabled as a kill switch.
+     */
+    public static final String POSITIONAL_DECODING_SETTING = "esql.datasource.ndjson.positional_decoding";
+    public static final boolean DEFAULT_POSITIONAL_DECODING = false;
+
+    /**
      * Node-level setting for the parallel-parsing segment size. Larger segments amortise the fixed
      * Java/Jackson per-segment setup cost; smaller segments enable parallelism on smaller files.
      * Also overridable per-query via the {@code segment_size} key in {@code WITH (...)}.
@@ -259,6 +267,11 @@ public class NdJsonFormatReader implements SegmentableFormatReader {
         return resolved.getAsInt(SCHEMA_SAMPLE_SIZE_SETTING, DEFAULT_SCHEMA_SAMPLE_SIZE);
     }
 
+    private static boolean positionalDecoding(Settings settings) {
+        Settings resolved = settings == null ? Settings.EMPTY : settings;
+        return resolved.getAsBoolean(POSITIONAL_DECODING_SETTING, DEFAULT_POSITIONAL_DECODING);
+    }
+
     private static long segmentSize(Settings settings) {
         Settings resolved = settings == null ? Settings.EMPTY : settings;
         ByteSizeValue value = resolved.getAsBytesSize(SEGMENT_SIZE_SETTING, DEFAULT_SEGMENT_SIZE);
@@ -353,7 +366,8 @@ public class NdJsonFormatReader implements SegmentableFormatReader {
             trimLastPartialLine,
             effectiveSchema,
             errorPolicy,
-            counters
+            counters,
+            positionalDecoding(settings)
         );
     }
 

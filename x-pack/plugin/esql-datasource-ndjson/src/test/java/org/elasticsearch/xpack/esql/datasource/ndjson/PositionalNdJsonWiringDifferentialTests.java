@@ -41,12 +41,7 @@ import java.util.List;
 public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
 
     private static final String[] NAMES = { "a_long", "b_int", "c_name", "d_ratio", "e_flag" };
-    private static final DataType[] TYPES = {
-        DataType.LONG,
-        DataType.INTEGER,
-        DataType.KEYWORD,
-        DataType.DOUBLE,
-        DataType.BOOLEAN };
+    private static final DataType[] TYPES = { DataType.LONG, DataType.INTEGER, DataType.KEYWORD, DataType.DOUBLE, DataType.BOOLEAN };
 
     private BlockFactory blockFactory;
 
@@ -80,6 +75,44 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
         }
     }
 
+    /**
+     * Raw bytes Jackson rejects — invalid UTF-8 lead/continuation/truncation, an unescaped control
+     * byte, a lone low surrogate — must make positional defer (so both paths skip the line under
+     * lenient), while a valid multi-byte string (Cyrillic) survives in both. Proves the UTF-8
+     * validation matches Jackson and never crashes on adversarial bytes.
+     */
+    private static final int INVALID_UTF8_LEAD = 0xFF;       // not a valid UTF-8 lead byte
+    private static final int LONE_CONTINUATION_BYTE = 0x80;   // continuation byte with no lead
+    private static final int TRUNCATED_2BYTE_LEAD = 0xC3;     // 2-byte lead with no continuation following
+    private static final int UNESCAPED_CONTROL_BYTE = 0x01;   // raw control char (JSON requires it escaped)
+    private static final String LONE_LOW_SURROGATE_ESCAPE = "\\" + "uDC00"; // JSON escape for an unpaired low surrogate
+    private static final String CYRILLIC_VALID = "да";        // valid multi-byte UTF-8 that must be accepted
+
+    public void testRawInvalidUtf8AndControlBytesMatchJackson() throws IOException {
+        java.io.ByteArrayOutputStream doc = new java.io.ByteArrayOutputStream();
+        appendUtf8(doc, "{\"a_long\":1,\"b_int\":2,\"c_name\":\"ok\",\"d_ratio\":1.5,\"e_flag\":true}\n");
+        appendBadStringLine(doc, INVALID_UTF8_LEAD);
+        appendBadStringLine(doc, LONE_CONTINUATION_BYTE);
+        appendBadStringLine(doc, TRUNCATED_2BYTE_LEAD);
+        appendBadStringLine(doc, UNESCAPED_CONTROL_BYTE);
+        appendUtf8(doc, "{\"c_name\":\"" + LONE_LOW_SURROGATE_ESCAPE + "\"}\n");
+        appendUtf8(doc, "{\"a_long\":9,\"c_name\":\"" + CYRILLIC_VALID + "\"}\n"); // valid Cyrillic must survive
+        appendUtf8(doc, "{\"a_long\":3,\"b_int\":4,\"c_name\":\"end\",\"d_ratio\":2.5,\"e_flag\":false}\n");
+        assertWiringMatchesJackson(doc.toByteArray(), randomFrom(1, 4, 1024), ErrorPolicy.LENIENT);
+    }
+
+    /** A {@code c_name} string line with {@code rawByte} embedded mid-value — a byte Jackson rejects. */
+    private void appendBadStringLine(java.io.ByteArrayOutputStream doc, int rawByte) {
+        appendUtf8(doc, "{\"c_name\":\"a");
+        doc.write(rawByte);
+        appendUtf8(doc, "b\"}\n");
+    }
+
+    private static void appendUtf8(java.io.ByteArrayOutputStream out, String s) {
+        byte[] b = s.getBytes(StandardCharsets.UTF_8);
+        out.write(b, 0, b.length);
+    }
+
     private void assertWiringMatchesJackson(byte[] bytes, int batchSize, ErrorPolicy policy) throws IOException {
         List<Object[]> positional = drainRows(bytes, batchSize, policy, true);
         List<Object[]> jackson = drainRows(bytes, batchSize, policy, false);
@@ -102,12 +135,11 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
                 batchSize,
                 blockFactory,
                 policy,
-                "test://wiring"
+                "test://wiring",
+                new NdJsonReaderCounters()
             )
         ) {
-            if (positional == false) {
-                dec.setPositionalEnabled(false);
-            }
+            dec.setPositionalEnabled(positional); // explicit: positional default is now opt-in (off)
             while (true) {
                 Page page = dec.decodePage();
                 if (page == null) {
@@ -131,20 +163,33 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
         if (b.isNull(pos)) {
             return null;
         }
+        int count = b.getValueCount(pos);
+        int first = b.getFirstValueIndex(pos);
+        if (count == 1) {
+            return scalarAt(b, first);
+        }
+        List<Object> vals = new ArrayList<>(count); // multi-value (array values reached via Jackson fallback)
+        for (int i = 0; i < count; i++) {
+            vals.add(scalarAt(b, first + i));
+        }
+        return vals;
+    }
+
+    private static Object scalarAt(Block b, int valueIndex) {
         if (b instanceof LongBlock x) {
-            return x.getLong(pos);
+            return x.getLong(valueIndex);
         }
         if (b instanceof IntBlock x) {
-            return x.getInt(pos);
+            return x.getInt(valueIndex);
         }
         if (b instanceof DoubleBlock x) {
-            return x.getDouble(pos);
+            return x.getDouble(valueIndex);
         }
         if (b instanceof BooleanBlock x) {
-            return x.getBoolean(pos);
+            return x.getBoolean(valueIndex);
         }
         if (b instanceof BytesRefBlock x) {
-            return BytesRef.deepCopyOf(x.getBytesRef(pos, new BytesRef()));
+            return BytesRef.deepCopyOf(x.getBytesRef(valueIndex, new BytesRef()));
         }
         throw new AssertionError("unexpected block type: " + b.getClass());
     }
@@ -177,7 +222,13 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
             "not json at all",                     // not an object
             "{\"c_name\":\"x\" \"e_flag\":true}",   // missing comma
             "{\"a_long\":1,}",                      // trailing comma
-            "{\"d_ratio\":1.2.3}"                   // malformed number
+            "{\"d_ratio\":1.2.3}",                  // malformed number
+            "{\"a_long\":007}",                     // leading zeros (canonical-JSON reject)
+            "{\"b_int\":+5}",                       // leading plus (canonical-JSON reject)
+            "{\"d_ratio\":.5}",                     // leading dot (canonical-JSON reject)
+            "{\"a_long\":-}",                       // lone minus
+            "{\"d_ratio\":1e}",                     // empty exponent
+            "{\"a_long\":99999999999999999999999}"  // overflows long range
         );
     }
 
@@ -224,6 +275,15 @@ public class PositionalNdJsonWiringDifferentialTests extends ESTestCase {
     }
 
     private String randomValue(int col) {
+        // ~1 in 9 values is an array: positional defers on '[' and Jackson decodes it to a multi-value
+        // block, so this exercises the defer-to-success fallback path (must still match pure Jackson).
+        if (randomInt(8) == 0) {
+            return "[" + scalarJson(col) + "," + scalarJson(col) + "]";
+        }
+        return scalarJson(col);
+    }
+
+    private String scalarJson(int col) {
         return switch (TYPES[col]) {
             case LONG -> Long.toString(randomLong());
             case INTEGER -> Integer.toString(randomInt());

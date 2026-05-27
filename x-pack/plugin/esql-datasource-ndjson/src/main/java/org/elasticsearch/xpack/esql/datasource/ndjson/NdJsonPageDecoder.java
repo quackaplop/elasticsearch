@@ -104,8 +104,12 @@ public class NdJsonPageDecoder implements Closeable {
      * (unchanged behavior). Active only on the byte-array ({@link #sourceBytes}) path.
      */
     private final PositionalNdJsonDecoder positional;
-    /** Test/bench toggle to force the pure-Jackson path even when {@link #positional} is available. */
-    private boolean positionalEnabled = true;
+    /**
+     * Whether the positional fast path is enabled. Opt-in, default {@code false} (pure Jackson):
+     * production behavior is unchanged unless {@code esql.datasource.ndjson.positional_decoding} is
+     * turned on. {@link NdJsonPageIterator} flips this from the resolved setting; tests also set it.
+     */
+    private boolean positionalEnabled = false;
     /** Line cursor into {@link #sourceBytes} for the positional path; independent of {@link #parser}. */
     private int positionalCursor;
     private long errorCount;
