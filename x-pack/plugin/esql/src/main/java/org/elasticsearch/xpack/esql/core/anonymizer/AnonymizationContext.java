@@ -51,7 +51,6 @@ public final class AnonymizationContext {
      */
     private static final int TOKEN_HEX_LEN = 12;
 
-    private final byte[] clusterKey;
     private final Mac mac;
     private final Map<String, String> columnTokens = new HashMap<>();
     private final Map<String, String> indexTokens = new HashMap<>();
@@ -90,7 +89,7 @@ public final class AnonymizationContext {
     };
 
     private AnonymizationContext(String clusterUuid) {
-        this.clusterKey = (clusterUuid == null ? "" : clusterUuid).getBytes(StandardCharsets.UTF_8);
+        byte[] clusterKey = (clusterUuid == null ? "" : clusterUuid).getBytes(StandardCharsets.UTF_8);
         // One Mac instance per submission, reused across every token() call. Mac is not
         // thread-safe but AnonymizationContext is constructed per submission and used single-
         // threadedly, so caching saves the Mac.getInstance() + SecretKeySpec allocations per

@@ -79,7 +79,13 @@ public class UnresolvedStar extends UnresolvedNamedExpression {
 
     @Override
     public void nodeString(StringBuilder sb, NodeStringFormat format, NodeStringMapper mapper) {
-        sb.append(toString());
+        // toString() embeds the qualifier name raw; route it through the mapper. Identity is
+        // byte-identical (column pass-through), the {@code .*} stays structural.
+        sb.append(UNRESOLVED_PREFIX);
+        if (qualifier() != null) {
+            sb.append(mapper.column(qualifier().name())).append('.');
+        }
+        sb.append('*');
     }
 
     @Override

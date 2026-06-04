@@ -151,7 +151,16 @@ public class UnresolvedFunction extends Function implements Unresolvable {
 
     @Override
     public void nodeString(StringBuilder sb, NodeStringFormat format, NodeStringMapper mapper) {
-        sb.append(toString());
+        // toString() emits the function name + argument expressions raw; route the name through the
+        // mapper and render each argument through its own nodeString so embedded identifiers tokenize.
+        sb.append(UNRESOLVED_PREFIX).append(mapper.column(name)).append('[');
+        for (int i = 0; i < children().size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            children().get(i).nodeString(sb, format, mapper);
+        }
+        sb.append(']');
     }
 
     @Override
