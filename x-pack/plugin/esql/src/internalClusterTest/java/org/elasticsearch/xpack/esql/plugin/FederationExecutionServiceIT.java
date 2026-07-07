@@ -154,6 +154,68 @@ public class FederationExecutionServiceIT extends AbstractExternalDataSourceIT {
     }
 
     /**
+     * The SCHEMA half: {@link FederationExecutionService#fetchAbstractionSchema} resolves the abstraction on its home
+     * cluster and returns its REAL output attributes — the same schema a direct {@code FROM <name>} run reports. This is
+     * the round-trip the coordinator makes during resolution (before it can build the {@code Boundary.REMOTE} leaf).
+     */
+    public void testFetchAbstractionSchemaReturnsRealSchema() throws Exception {
+        List<Attribute> expectedSchema;
+        try (var response = run(EsqlQueryRequest.syncEsqlQueryRequest("FROM employees"), TIMEOUT)) {
+            expectedSchema = schemaOf(response);
+        }
+
+        List<Attribute> resolved = fetchSchema("employees");
+        assertThat(namesAndTypes(resolved), equalTo(namesAndTypes(expectedSchema)));
+    }
+
+    /** The schema half also resolves a VIEW-over-index body to its real output attributes. */
+    public void testFetchViewSchemaReturnsRealSchema() throws Exception {
+        createIndex("emp_index");
+        prepareIndex("emp_index").setId("1").setSource(Map.of("emp_no", 1, "first_name", "Alice")).get();
+        refresh("emp_index");
+        assertAcked(
+            client().execute(PutViewAction.INSTANCE, new PutViewAction.Request(TIMEOUT, TIMEOUT, new View("emp_view", "FROM emp_index")))
+        );
+
+        List<Attribute> expectedSchema;
+        try (var response = run(EsqlQueryRequest.syncEsqlQueryRequest("FROM emp_view"), TIMEOUT)) {
+            expectedSchema = schemaOf(response);
+        }
+
+        List<Attribute> resolved = fetchSchema("emp_view");
+        assertThat(namesAndTypes(resolved), equalTo(namesAndTypes(expectedSchema)));
+    }
+
+    /** Drives {@link FederationExecutionService#fetchAbstractionSchema} against the local node (empty handle). */
+    private List<Attribute> fetchSchema(String abstractionName) throws Exception {
+        String node = internalCluster().getNodeNames()[0];
+        TransportService transportService = internalCluster().getInstance(TransportService.class, node);
+        ExchangeService exchangeService = internalCluster().getInstance(ExchangeService.class, node);
+        ThreadPool threadPool = transportService.getThreadPool();
+        TaskManager taskManager = transportService.getTaskManager();
+
+        FederationExecutionService service = new FederationExecutionService(
+            transportService,
+            exchangeService,
+            threadPool.executor(ThreadPool.Names.SEARCH)
+        );
+
+        EsqlQueryRequest rootRequest = EsqlQueryRequest.syncEsqlQueryRequest("FROM " + abstractionName);
+        CancellableTask rootTask = (CancellableTask) taskManager.register("transport", EsqlQueryAction.NAME, rootRequest);
+        try {
+            PlainActionFuture<List<Attribute>> future = new PlainActionFuture<>();
+            service.fetchAbstractionSchema(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY, abstractionName, rootTask, future);
+            return future.actionGet(TIMEOUT);
+        } finally {
+            taskManager.unregister(rootTask);
+        }
+    }
+
+    private static List<String> namesAndTypes(List<Attribute> attributes) {
+        return attributes.stream().map(a -> a.name() + ":" + a.dataType().typeName()).toList();
+    }
+
+    /**
      * Drives {@link FederationExecutionService#fetchAbstraction} for a single leaf against the local node (empty handle),
      * then drains the caller-owned source it wires into row-major values. This is the exact call
      * {@code RemoteAbstractionSourceOperator} will make once per leaf in Increment-3.
