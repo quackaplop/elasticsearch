@@ -84,4 +84,17 @@ public class AbstractExternalSourceSpecTestCaseTests extends ESTestCase {
             AbstractExternalSourceSpecTestCase.injectTrimSpaces("{\"null_value\": \"trim_spaces\"}")
         );
     }
+
+    /**
+     * A declared schema is nested objects deep, so the trailing entry of a csv/tsv directive can be an OBJECT.
+     * The injection walks back from the last brace, which is the outermost closer for a parser-guaranteed
+     * single object -- so the key must land beside the declaration, never inside it, where the csv reader
+     * would reject it as an unknown mapping field.
+     */
+    public void testInjectTrimSpacesLandsOutsideATrailingNestedObject() {
+        assertEquals(
+            "{\"mappings\": {\"properties\": {\"a\": {\"type\": \"keyword\"}}}, \"trim_spaces\": true}",
+            AbstractExternalSourceSpecTestCase.injectTrimSpaces("{\"mappings\": {\"properties\": {\"a\": {\"type\": \"keyword\"}}}}")
+        );
+    }
 }

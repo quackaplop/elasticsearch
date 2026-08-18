@@ -12,12 +12,14 @@ import org.elasticsearch.client.Response;
 import org.elasticsearch.client.ResponseException;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xcontent.XContentParserConfiguration;
 import org.elasticsearch.xcontent.json.JsonXContent;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -78,19 +80,25 @@ public final class DatasetRegistry {
 
     /**
      * Ensures a {@code dataset} named {@code name} bound to {@code dataSource} + {@code resource} with the
-     * format options in the {@code withJson} object (the {@code WITH {...}} JSON, or {@code null} for
-     * none) exists, issuing {@code PUT /_query/dataset/<name>} only when the content signature differs
-     * from the cached one. The owning {@code data_source} must already exist (register it first via
+     * options in the {@code withJson} object (the {@code WITH {...}} JSON, or {@code null} for none) exists,
+     * issuing {@code PUT /_query/dataset/<name>} only when the content signature differs from the cached
+     * one. The owning {@code data_source} must already exist (register it first via
      * {@link #ensureDataSource}); the CRUD layer rejects a dataset whose parent is missing.
      * <p>
+     * The directive's options are format settings except for the reserved {@link #MAPPINGS} key, whose value
+     * is the dataset's declared schema; {@link #parseDirectiveOptions} splits it out so it lands top-level in
+     * the PUT body rather than inside {@code settings}, where every provider's validator would reject it.
+     * <p>
      * The signature is keyed off the raw {@code withJson} so the JSON is parsed only on a cache miss, not
-     * on every spec invocation.
+     * on every spec invocation. Because it is the raw string, an edited declaration changes the signature and
+     * re-issues the create-or-replace PUT.
      */
     public static synchronized void ensureDataset(RestClient client, String name, String dataSource, String resource, String withJson)
         throws IOException {
         String signature = dataSource + "|" + resource + "|" + withJson;
         if (signature.equals(datasets.get(name)) == false) {
-            putDataset(client, name, dataSource, resource, parseSettings(withJson));
+            DatasetOptions options = parseDirectiveOptions(withJson);
+            putDataset(client, name, dataSource, resource, options.settings(), options.mappings());
             datasets.put(name, signature);
         }
     }
@@ -104,13 +112,75 @@ public final class DatasetRegistry {
         return prefix + resourcePath.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "_");
     }
 
-    /** Parses a {@code dataset:} directive's {@code WITH {...}} JSON into a settings map ({@code null} maps to empty). */
-    private static Map<String, Object> parseSettings(String withJson) throws IOException {
+    /**
+     * Reserved key inside a {@code dataset:} directive's {@code WITH {...}} JSON: its value is the dataset's
+     * declared schema, which {@code PUT /_query/dataset/<name>} takes as a top-level field beside
+     * {@code settings} rather than inside it. A declared schema cannot ride through {@code settings} because
+     * every provider's {@code DataSourceValidator} rejects setting names it does not know, so the split below
+     * is what makes a declaration expressible in a spec file at all. No datasource defines a setting by this
+     * name, so reserving it shadows nothing.
+     */
+    static final String MAPPINGS = "mappings";
+
+    /**
+     * The two shapes a directive's {@code WITH {...}} JSON contributes to the PUT body: the format
+     * {@code settings}, and the declared schema when the directive reserves {@link #MAPPINGS}.
+     */
+    record DatasetOptions(Map<String, Object> settings, @Nullable Map<String, Object> mappings) {}
+
+    /**
+     * Parses a {@code dataset:} directive's {@code WITH {...}} JSON ({@code null} maps to no settings and no
+     * declared schema), lifting the reserved {@link #MAPPINGS} key out of the settings map so
+     * {@link #datasetRequestBody} can emit it top-level.
+     * <p>
+     * A {@link #MAPPINGS} value that is not an object is rejected here, where the directive text is still at
+     * hand, rather than reaching the server as a type error. A structurally-valid but semantically wrong
+     * declaration (say an unknown {@code dynamic} value) is deliberately left to the server, whose parse
+     * error surfaces verbatim through {@link #assertOk}.
+     */
+    static DatasetOptions parseDirectiveOptions(String withJson) throws IOException {
         if (withJson == null) {
-            return Map.of();
+            return new DatasetOptions(Map.of(), null);
         }
+        Map<String, Object> options;
         try (XContentParser parser = JsonXContent.jsonXContent.createParser(XContentParserConfiguration.EMPTY, withJson)) {
-            return parser.map();
+            // mapOrdered, not map: a declaration WITHOUT a per-column `path` binds text columns positionally, so the
+            // order of `mappings.properties` decides which physical column each declared name reads. map() returns a
+            // HashMap, which would re-order the properties on the way into the PUT body and bind a positional
+            // declaration to arbitrary columns. DatasetMapping.parseMappings keeps a LinkedHashMap for the same reason.
+            options = parser.mapOrdered();
+        }
+        if (options.containsKey(MAPPINGS) == false) {
+            return new DatasetOptions(options, null);
+        }
+        // Removed via containsKey rather than a null return so an explicit "mappings": null reads as the
+        // authoring error it is, not as a directive that declares nothing.
+        Object declared = options.remove(MAPPINGS);
+        if (declared instanceof Map == false) {
+            throw new IllegalArgumentException(
+                "["
+                    + MAPPINGS
+                    + "] in a dataset directive's WITH must be a JSON object declaring the schema, got ["
+                    + declared
+                    + "]"
+            );
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> mappings = (Map<String, Object>) declared;
+        return new DatasetOptions(options, mappings);
+    }
+
+    /**
+     * Whether a {@code dataset:} directive's {@code WITH {...}} JSON declares a schema, i.e. reserves
+     * {@link #MAPPINGS}. Parses rather than string-matches, so a setting whose VALUE happens to be
+     * {@code "mappings"} does not read as a declaration. Used by the spec harness to guard the paths that
+     * cannot carry a declaration.
+     */
+    public static boolean declaresMappings(String withJson) {
+        try {
+            return parseDirectiveOptions(withJson).mappings() != null;
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot parse a dataset directive's WITH JSON [" + withJson + "]", e);
         }
     }
 
@@ -135,21 +205,61 @@ public final class DatasetRegistry {
 
     /**
      * Issues an uncached {@code PUT /_query/dataset/<name>} bound to {@code dataSource} + {@code resource}
-     * with the given format {@code settings}. Shared by {@link #ensureDataset} and by test bases that
-     * manage their own dataset lifecycle; the owning {@code data_source} must already exist.
+     * with the given format {@code settings} and no declared schema. Shared by test bases that manage their
+     * own dataset lifecycle; the owning {@code data_source} must already exist.
+     * <p>
+     * These callers pass literal settings rather than a directive string, so this overload does NOT inspect
+     * the map for {@link #MAPPINGS}: the reserved key is a property of the {@code dataset:} directive's
+     * {@code WITH} text, honoured only where that text is parsed. A caller declaring a schema deliberately
+     * uses {@link #putDataset(RestClient, String, String, String, Map, Map)}.
      */
     public static void putDataset(RestClient client, String name, String dataSource, String resource, Map<String, Object> settings)
         throws IOException {
+        putDataset(client, name, dataSource, resource, settings, null);
+    }
+
+    /**
+     * Issues an uncached {@code PUT /_query/dataset/<name>} bound to {@code dataSource} + {@code resource}
+     * with the given format {@code settings} and, when non-null, a declared schema as the body's top-level
+     * {@code mappings} field. The owning {@code data_source} must already exist.
+     */
+    public static void putDataset(
+        RestClient client,
+        String name,
+        String dataSource,
+        String resource,
+        Map<String, Object> settings,
+        @Nullable Map<String, Object> mappings
+    ) throws IOException {
         Request req = new Request("PUT", "/_query/dataset/" + name);
+        req.setJsonEntity(datasetRequestBody(dataSource, resource, settings, mappings));
+        assertOk(client.performRequest(req), "PUT dataset [" + name + "]");
+    }
+
+    /**
+     * The {@code PUT /_query/dataset/<name>} body: {@code data_source}, {@code resource}, {@code settings}
+     * when non-empty, then the declared {@code mappings} when the dataset declares one. Mirrors the field
+     * order and omit-when-absent shape {@code ExternalErrorSurfaceIT} already PUTs by hand, and appends
+     * {@code mappings} last so a body without a declaration is byte-for-byte what this registry emitted
+     * before declared schemas became reachable from a spec directive.
+     */
+    static String datasetRequestBody(
+        String dataSource,
+        String resource,
+        Map<String, Object> settings,
+        @Nullable Map<String, Object> mappings
+    ) throws IOException {
         try (XContentBuilder b = jsonBuilder()) {
             b.startObject().field("data_source", dataSource).field("resource", resource);
             if (settings.isEmpty() == false) {
                 b.field("settings", settings);
             }
+            if (mappings != null) {
+                b.field(MAPPINGS, mappings);
+            }
             b.endObject();
-            req.setJsonEntity(Strings.toString(b));
+            return Strings.toString(b);
         }
-        assertOk(client.performRequest(req), "PUT dataset [" + name + "]");
     }
 
     /**

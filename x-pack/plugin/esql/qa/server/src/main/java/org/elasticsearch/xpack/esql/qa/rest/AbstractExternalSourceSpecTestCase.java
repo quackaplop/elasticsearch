@@ -19,6 +19,7 @@ import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.datasources.AzureFixtureUtils;
 import org.elasticsearch.xpack.esql.datasources.AzureFixtureUtils.DataSourcesAzureHttpFixture;
 import org.elasticsearch.xpack.esql.datasources.DatasetRegistry;
+import org.elasticsearch.xpack.esql.datasources.EsqlDataSourcesCapabilities;
 import org.elasticsearch.xpack.esql.datasources.FixtureUtils;
 import org.elasticsearch.xpack.esql.datasources.GcsFixtureUtils;
 import org.elasticsearch.xpack.esql.datasources.GcsFixtureUtils.DataSourcesGcsHttpFixture;
@@ -385,6 +386,16 @@ public abstract class AbstractExternalSourceSpecTestCase extends EsqlSpecTestCas
             testCase.datasetSources.size() > 1
         );
 
+        // A declared schema is a property of the DATASET, not of a query: EXTERNAL has no clause that carries it, and
+        // copying the directive's reserved `mappings` key into an EXTERNAL WITH would fail the option validation
+        // instead of skipping. Deliberately dormant today -- the only EXTERNAL-rebuild suite (parquet-rs) reads
+        // shared external-*.csv-spec files, none of which declare a schema yet -- and it is what lets the shared
+        // files carry declarations later without failing that suite. Do not delete it as dead code.
+        assumeFalse(
+            "a declared schema cannot be expressed as an EXTERNAL ... WITH query; skipped on EXTERNAL-rebuild backends",
+            testCase.datasetSources.stream().anyMatch(source -> DatasetRegistry.declaresMappings(source.withJson()))
+        );
+
         // Pick the Azure URI form once per test so wildcard expansion sees a single, consistent form.
         useAzureHadoopForm = storageBackend == StorageBackend.AZURE && randomBoolean();
 
@@ -459,6 +470,22 @@ public abstract class AbstractExternalSourceSpecTestCase extends EsqlSpecTestCas
             "FROM <dataset> requires the [dataset_in_from_command] capability",
             hasCapabilities(client(), List.of(EsqlCapabilities.Cap.DATASET_IN_FROM_COMMAND.capabilityName()))
         );
+        // A declared schema rides the PUT body's top-level `mappings`, which an older node's request parser rejects
+        // outright and whose wire form is transport-version gated. No configuration reaches here on an old cluster
+        // today (the BWC-flavoured spec suites skip dataset-backed specs in EsqlSpecTestCase), so this mirrors the
+        // assume above purely so a future BWC reuse of this harness skips instead of failing on a parse error.
+        if (testCase.datasetSources.stream().anyMatch(source -> DatasetRegistry.declaresMappings(source.withJson()))) {
+            assumeTrue(
+                "a declared schema requires the [" + EsqlDataSourcesCapabilities.DATASET_DECLARED_SCHEMA + "] capability",
+                clusterHasCapability(
+                    client(),
+                    "PUT",
+                    "/_query/dataset/{name}",
+                    List.of(),
+                    List.of(EsqlDataSourcesCapabilities.DATASET_DECLARED_SCHEMA)
+                ).orElse(false)
+            );
+        }
         // HTTP cannot list a directory, so multi-file/Hive-partitioned glob datasets cannot be resolved
         // over it; skip those on the HTTP backend (the glob lives in the dataset's resource template).
         for (DatasetSource source : testCase.datasetSources) {
