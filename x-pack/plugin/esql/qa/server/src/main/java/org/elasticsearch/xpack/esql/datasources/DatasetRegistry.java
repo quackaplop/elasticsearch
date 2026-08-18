@@ -158,11 +158,7 @@ public final class DatasetRegistry {
         Object declared = options.remove(MAPPINGS);
         if (declared instanceof Map == false) {
             throw new IllegalArgumentException(
-                "["
-                    + MAPPINGS
-                    + "] in a dataset directive's WITH must be a JSON object declaring the schema, got ["
-                    + declared
-                    + "]"
+                "[" + MAPPINGS + "] in a dataset directive's WITH must be a JSON object declaring the schema, got [" + declared + "]"
             );
         }
         @SuppressWarnings("unchecked")

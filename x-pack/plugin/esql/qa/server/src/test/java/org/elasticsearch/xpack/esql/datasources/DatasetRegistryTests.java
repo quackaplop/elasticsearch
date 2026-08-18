@@ -50,14 +50,9 @@ public class DatasetRegistryTests extends ESTestCase {
 
         DatasetRegistry.DatasetOptions options = DatasetRegistry.parseDirectiveOptions(withJson);
         assertEquals(Map.of("header_row", true), options.settings());
-        assertEquals(
-            Map.of("dynamic", "false", "properties", Map.of("id", Map.of("type", "long", "path", "emp_no"))),
-            options.mappings()
-        );
+        assertEquals(Map.of("dynamic", "false", "properties", Map.of("id", Map.of("type", "long", "path", "emp_no"))), options.mappings());
 
-        Map<String, Object> body = parseJson(
-            DatasetRegistry.datasetRequestBody("ds", "s3://b/k", options.settings(), options.mappings())
-        );
+        Map<String, Object> body = parseJson(DatasetRegistry.datasetRequestBody("ds", "s3://b/k", options.settings(), options.mappings()));
         assertEquals(Map.of("header_row", true), body.get("settings"));
         assertEquals(options.mappings(), body.get("mappings"));
     }
@@ -141,8 +136,13 @@ public class DatasetRegistryTests extends ESTestCase {
      * so the body must carry the properties in the order the directive wrote them.
      */
     public void testPositionalDeclarationKeepsPropertyOrder() throws IOException {
-        String withJson = """
-            {"mappings": {"dynamic": "false", "properties": {            "zulu": {"type": "keyword"},             "alpha": {"type": "long"},             "mike": {"type": "keyword"},             "bravo": {"type": "long"}}}}""";
+        // Names chosen so insertion order is neither alphabetical nor hash order, i.e. an unordered parse
+        // reliably scrambles them rather than coincidentally agreeing.
+        String withJson = "{\"mappings\": {\"dynamic\": \"false\", \"properties\": {"
+            + "\"zulu\": {\"type\": \"keyword\"}, "
+            + "\"alpha\": {\"type\": \"long\"}, "
+            + "\"mike\": {\"type\": \"keyword\"}, "
+            + "\"bravo\": {\"type\": \"long\"}}}}";
 
         DatasetRegistry.DatasetOptions options = DatasetRegistry.parseDirectiveOptions(withJson);
         @SuppressWarnings("unchecked")
