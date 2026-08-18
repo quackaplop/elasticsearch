@@ -130,12 +130,13 @@ public class DatasetRegistryTests extends ESTestCase {
     }
 
     /**
-     * A declaration with no per-column {@code path} binds text columns POSITIONALLY, so the order of
-     * {@code properties} decides which physical column each declared name reads. Parsing into an unordered map
-     * would re-order them on the way into the PUT body and silently bind the declaration to the wrong columns --
-     * so the body must carry the properties in the order the directive wrote them.
+     * The order of {@code properties} is the declared schema's column order, which a declared read surfaces as its
+     * output column order -- so the body must carry the properties in the order the directive wrote them. Parsing
+     * into an unordered map would return the columns in an arbitrary order. (Binding itself is BY NAME, keyed on the
+     * schema's provenance rather than on whether a {@code path} was written -- see
+     * {@code FormatReader#withDeclaredPathBinding} -- so this is about column order, not about which column is read.)
      */
-    public void testPositionalDeclarationKeepsPropertyOrder() throws IOException {
+    public void testDeclarationKeepsPropertyOrder() throws IOException {
         // Names chosen so insertion order is neither alphabetical nor hash order, i.e. an unordered parse
         // reliably scrambles them rather than coincidentally agreeing.
         String withJson = "{\"mappings\": {\"dynamic\": \"false\", \"properties\": {"

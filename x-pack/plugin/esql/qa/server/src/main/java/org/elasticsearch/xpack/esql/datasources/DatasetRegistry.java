@@ -144,10 +144,10 @@ public final class DatasetRegistry {
         }
         Map<String, Object> options;
         try (XContentParser parser = JsonXContent.jsonXContent.createParser(XContentParserConfiguration.EMPTY, withJson)) {
-            // mapOrdered, not map: a declaration WITHOUT a per-column `path` binds text columns positionally, so the
-            // order of `mappings.properties` decides which physical column each declared name reads. map() returns a
-            // HashMap, which would re-order the properties on the way into the PUT body and bind a positional
-            // declaration to arbitrary columns. DatasetMapping.parseMappings keeps a LinkedHashMap for the same reason.
+            // mapOrdered, not map: the order of `mappings.properties` is the declared schema's column order, which a
+            // declared read surfaces as its output column order. map() returns a HashMap, so the properties would be
+            // re-ordered on the way into the PUT body and the columns would come back in an arbitrary order.
+            // DatasetMapping.parseMappings keeps a LinkedHashMap for the same reason.
             options = parser.mapOrdered();
         }
         if (options.containsKey(MAPPINGS) == false) {

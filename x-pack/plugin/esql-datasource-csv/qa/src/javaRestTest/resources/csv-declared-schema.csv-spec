@@ -37,7 +37,8 @@ id:long | name:keyword
 
 // A declaration and format settings must BOTH survive the split, so this case is discriminating on each
 // axis independently. header_row:false turns the typed header line into data row 0 and synthesizes
-// f0..f22 (column_prefix "f"), so `path: "f1"` names the emp_no column positionally-by-name. Lose the
+// f0..f22 (column_prefix "f"), so `path: "f1"` names field 1, the emp_no column -- a headerless file's
+// column names ARE its positions, so the declaration self-binds without reading any header. Lose the
 // settings and the file is read WITH its header, f1 names nothing, and the column reads null; lose the
 // declaration and there is no `id` column at all.
 strictDeclaredSchemaCoexistsWithFormatSettings
