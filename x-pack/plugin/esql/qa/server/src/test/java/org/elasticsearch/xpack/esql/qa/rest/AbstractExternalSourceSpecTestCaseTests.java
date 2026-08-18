@@ -88,8 +88,8 @@ public class AbstractExternalSourceSpecTestCaseTests extends ESTestCase {
     /**
      * A declared schema is nested objects deep, so the trailing entry of a csv/tsv directive can be an OBJECT.
      * The injection walks back from the last brace, which is the outermost closer for a parser-guaranteed
-     * single object -- so the key must land beside the declaration, never inside it, where the csv reader
-     * would reject it as an unknown mapping field.
+     * single object -- so the key must land beside the declaration, never inside it, where the dataset PUT's
+     * mappings parser would reject it as an unknown mappings field.
      */
     public void testInjectTrimSpacesLandsOutsideATrailingNestedObject() {
         assertEquals(

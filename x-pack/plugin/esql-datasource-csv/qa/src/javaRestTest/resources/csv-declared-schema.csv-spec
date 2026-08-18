@@ -16,6 +16,74 @@
 // same derivation inference uses, so declared and inferred reads name the same physical column.
 // Dataset names encode their options: the same name always carries the same declaration.
 
+// THE BASELINE: a declaration that says exactly what inference would have said. Declaring the truth must
+// change nothing -- same column names, same types, same values as the inferred read. The expected table below
+// is copied verbatim from csv-basic.csv-spec's readAllEmployeesScalar, which reads this same fixture with NO
+// declaration, so any divergence between the two is a defect in the declared path rather than a test
+// disagreement. Every other case in this file deliberately diverges from inference (renames, retypes, subsets);
+// this one pins that the declared machinery is a no-op when it has nothing to change, which is the strict/
+// dynamic orthogonality invariant at full strength (esql-planning#1307).
+//
+// Types are the INFERRED ones, i.e. post-widening: the fixture's typed header annotates emp_no:integer,
+// height:double and so on, and those are what a declaration has to restate to be a no-op.
+strictDeclaredSchemaMatchingInferenceChangesNothing
+required_capability: dataset_in_from_command
+dataset: employees_declared_noop: "{{employees_no_mv}}" WITH {"mappings": {"dynamic": "false", "properties": {"emp_no": {"type": "integer"}, "first_name": {"type": "keyword"}, "last_name": {"type": "keyword"}, "birth_date": {"type": "date"}, "gender": {"type": "keyword"}, "hire_date": {"type": "date"}, "languages": {"type": "integer"}, "height": {"type": "double"}, "salary": {"type": "integer"}, "still_hired": {"type": "boolean"}}}}
+
+FROM employees_declared_noop
+| KEEP emp_no, first_name, last_name, birth_date, gender, hire_date, languages, height, salary, still_hired
+| SORT emp_no
+| LIMIT 5;
+
+emp_no:integer | first_name:keyword | last_name:keyword | birth_date:date          | gender:keyword | hire_date:date           | languages:integer | height:double | salary:integer | still_hired:boolean
+10001          | "Georgi"           | "Facello"         | 1953-09-02T00:00:00.000Z | "M"            | 1986-06-26T00:00:00.000Z | 2                 | 2.03          | 57305          | true
+10002          | "Bezalel"          | "Simmel"          | 1964-06-02T00:00:00.000Z | "F"            | 1985-11-21T00:00:00.000Z | 5                 | 2.08          | 56371          | true
+10003          | "Parto"            | "Bamford"         | 1959-12-03T00:00:00.000Z | "M"            | 1986-08-28T00:00:00.000Z | 4                 | 1.83          | 61805          | false
+10004          | "Chirstian"        | "Koblick"         | 1954-05-01T00:00:00.000Z | "M"            | 1986-12-01T00:00:00.000Z | 5                 | 1.78          | 36174          | true
+10005          | "Kyoichi"          | "Maliniak"        | 1955-01-21T00:00:00.000Z | "M"            | 1989-09-12T00:00:00.000Z | 1                 | 2.05          | 63528          | true
+;
+
+// The no-op taken all the way: EVERY one of the fixture's 23 columns declared, so strict has nothing left to
+// infer and the declaration is the entire schema. Pins two things the 10-column no-op above does not: that a
+// DOTTED declared name (languages.long, height.float, salary_change.int) binds to the header column of that
+// name rather than being read as a nested path, and that the types a no-op must restate are the WIDENED ones
+// -- the header annotates languages.short:short and height.float:float, but inference widens short/byte to
+// integer and float/half_float/scaled_float to double, so those are what the declaration says.
+strictFullyDeclaredSchemaMatchingInferenceChangesNothing
+required_capability: dataset_in_from_command
+dataset: employees_declared_full: "{{employees_no_mv}}" WITH {"mappings": {"dynamic": "false", "properties": {"birth_date": {"type": "date"}, "emp_no": {"type": "integer"}, "first_name": {"type": "keyword"}, "gender": {"type": "keyword"}, "hire_date": {"type": "date"}, "languages": {"type": "integer"}, "languages.long": {"type": "long"}, "languages.short": {"type": "integer"}, "languages.byte": {"type": "integer"}, "last_name": {"type": "keyword"}, "salary": {"type": "integer"}, "height": {"type": "double"}, "height.float": {"type": "double"}, "height.scaled_float": {"type": "double"}, "height.half_float": {"type": "double"}, "still_hired": {"type": "boolean"}, "avg_worked_seconds": {"type": "long"}, "job_positions": {"type": "keyword"}, "is_rehired": {"type": "boolean"}, "salary_change": {"type": "double"}, "salary_change.int": {"type": "integer"}, "salary_change.long": {"type": "long"}, "salary_change.keyword": {"type": "keyword"}}}}
+
+FROM employees_declared_full
+| KEEP emp_no, first_name, languages.long, height.float, salary_change.int
+| SORT emp_no
+| LIMIT 3;
+
+emp_no:integer | first_name:keyword | languages.long:long | height.float:double | salary_change.int:integer
+10001          | "Georgi"           | 2                   | 2.03                | 1
+10002          | "Bezalel"          | 5                   | 2.08                | -7
+10003          | "Parto"            | 4                   | 1.83                | 14
+;
+
+// The same no-op declaration under dynamic:true, where it overlays inference instead of replacing it. An
+// overlay that restates what inference already derived must also change nothing, so this reads identically to
+// the strict no-op above and to the undeclared read -- the knob is a no-op when the declaration is.
+dynamicDeclaredSchemaMatchingInferenceChangesNothing
+required_capability: dataset_in_from_command
+dataset: employees_declared_noop_overlay: "{{employees_no_mv}}" WITH {"mappings": {"dynamic": "true", "properties": {"emp_no": {"type": "integer"}, "first_name": {"type": "keyword"}, "last_name": {"type": "keyword"}, "birth_date": {"type": "date"}, "gender": {"type": "keyword"}, "hire_date": {"type": "date"}, "languages": {"type": "integer"}, "height": {"type": "double"}, "salary": {"type": "integer"}, "still_hired": {"type": "boolean"}}}}
+
+FROM employees_declared_noop_overlay
+| KEEP emp_no, first_name, last_name, birth_date, gender, hire_date, languages, height, salary, still_hired
+| SORT emp_no
+| LIMIT 5;
+
+emp_no:integer | first_name:keyword | last_name:keyword | birth_date:date          | gender:keyword | hire_date:date           | languages:integer | height:double | salary:integer | still_hired:boolean
+10001          | "Georgi"           | "Facello"         | 1953-09-02T00:00:00.000Z | "M"            | 1986-06-26T00:00:00.000Z | 2                 | 2.03          | 57305          | true
+10002          | "Bezalel"          | "Simmel"          | 1964-06-02T00:00:00.000Z | "F"            | 1985-11-21T00:00:00.000Z | 5                 | 2.08          | 56371          | true
+10003          | "Parto"            | "Bamford"         | 1959-12-03T00:00:00.000Z | "M"            | 1986-08-28T00:00:00.000Z | 4                 | 1.83          | 61805          | false
+10004          | "Chirstian"        | "Koblick"         | 1954-05-01T00:00:00.000Z | "M"            | 1986-12-01T00:00:00.000Z | 5                 | 1.78          | 36174          | true
+10005          | "Kyoichi"          | "Maliniak"        | 1955-01-21T00:00:00.000Z | "M"            | 1989-09-12T00:00:00.000Z | 1                 | 2.05          | 63528          | true
+;
+
 // Strict declaration that renames and retypes: physical emp_no/first_name are exposed as id/name, and
 // every other column of the file is hidden. Discriminating by construction -- if the declaration were
 // dropped anywhere in the chain the dataset would resolve by inference to the file's 23 header columns

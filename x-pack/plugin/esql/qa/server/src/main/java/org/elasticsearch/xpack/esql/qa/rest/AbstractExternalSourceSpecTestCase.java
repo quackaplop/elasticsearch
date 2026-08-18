@@ -620,6 +620,10 @@ public abstract class AbstractExternalSourceSpecTestCase extends EsqlSpecTestCas
      * ({@link #runDatasetMode()}) and when rebuilding an {@code EXTERNAL} query
      * ({@link #rebuildExternalFromDatasets}).
      * <p>
+     * Passed through as one blob: the reserved {@code mappings} key (a declared schema) is split out of it by
+     * {@code DatasetRegistry}, not here. The injection below therefore has to land at the TOP level of the
+     * object even when a nested {@code mappings} object is its last entry.
+     * <p>
      * The CSV/TSV test fixtures (employees.csv, books.csv, ...) are column-aligned with padding spaces for
      * readability, so their expected spec values assume trimming. The reader default is now no-trim (RFC
      * 4180 — spaces are part of a field), so read these aligned fixtures with {@code trim_spaces: true} to

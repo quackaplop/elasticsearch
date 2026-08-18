@@ -14,24 +14,24 @@
 // HTTP cannot list a directory, so the harness skips these glob reads there.
 
 // A strict declaration pins the payload to one renamed, retyped column, and the path-derived partition
-// column still resolves and buckets correctly alongside it. If the declaration were dropped the payload
-// would be the fixture's full inferred schema; if partition enrichment did not compose with a declared
-// schema, `lang` would be an unknown column here.
+// column still resolves and buckets correctly alongside it. COUNT(id) pins the declared axis -- drop the
+// declaration and `id` is an unknown column -- while `lang` pins the path-derived axis, so neither can be
+// lost silently.
 strictDeclaredSchemaComposesWithHivePartitionColumn
 required_capability: dataset_in_from_command
 dataset: employees_hive_declared: "{{employees_hive}}" WITH {"mappings": {"dynamic": "false", "properties": {"id": {"type": "long", "path": "emp_no"}}}}
 
 FROM employees_hive_declared
-| STATS count = COUNT(*) BY lang
+| STATS count = COUNT(*), ids = COUNT(id) BY lang
 | SORT lang NULLS LAST;
 
-count:long | lang:integer
-15         | 1
-19         | 2
-17         | 3
-18         | 4
-21         | 5
-10         | null
+count:long | ids:long | lang:integer
+15         | 15       | 1
+19         | 19       | 2
+17         | 17       | 3
+18         | 18       | 4
+21         | 21       | 5
+10         | 10       | null
 ;
 
 // Filtering on the path-derived column while reading the declared payload column: the partition prune and
