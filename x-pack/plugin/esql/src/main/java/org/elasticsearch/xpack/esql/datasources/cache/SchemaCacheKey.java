@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.datasources.cache;
 
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.xpack.esql.datasources.DefinitionVersion;
 import org.elasticsearch.xpack.esql.datasources.FileSetFingerprint;
 
 import java.util.Map;
@@ -32,7 +33,8 @@ public record SchemaCacheKey(
     String formatConfig,
     String endpoint,
     String region,
-    @Nullable FileSetFingerprint fileSetFingerprint
+    @Nullable FileSetFingerprint fileSetFingerprint,
+    String definitionVersion
 ) {
     // Keep this set in sync with every option keyed off the WITH map by a FormatReader's
     // parseOptionsFromConfig / withConfig. The intent is broader than "changes the inferred
@@ -104,6 +106,23 @@ public record SchemaCacheKey(
         "token"
     );
 
+    /**
+     * The version of the stored definitions this query reads under, as a named component rather than
+     * a format setting: it is not an option a reader parses, and it must not be filtered by the
+     * format-affecting allow-list that decides which settings change how bytes become rows.
+     * <p>
+     * Absent for a query that reaches the cache without a registered dataset behind it, where there is
+     * no definition to version. Such entries share one version value and are addressed as they were
+     * before.
+     */
+    static String definitionVersionOf(Map<String, Object> config) {
+        if (config == null) {
+            return "";
+        }
+        Object v = config.get(DefinitionVersion.CONFIG_KEY);
+        return v instanceof String s ? s : "";
+    }
+
     public static SchemaCacheKey build(String canonicalPath, long mtime, String formatType, Map<String, Object> config) {
         EndpointRegion location = EndpointRegion.of(config);
         String formatConfig = buildFormatConfig(config);
@@ -114,7 +133,8 @@ public record SchemaCacheKey(
             formatConfig,
             location.endpoint(),
             location.region(),
-            null
+            null,
+            definitionVersionOf(config)
         );
     }
 
@@ -185,7 +205,8 @@ public record SchemaCacheKey(
             buildFormatConfig(config),
             location.endpoint(),
             location.region(),
-            fingerprint
+            fingerprint,
+            definitionVersionOf(config)
         );
     }
 
