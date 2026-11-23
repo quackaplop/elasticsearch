@@ -6,6 +6,7 @@
  */
 package org.elasticsearch.xpack.esql.sourcefunction;
 
+import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.parser.ParsingException;
 
 import java.util.HashSet;
@@ -40,14 +41,17 @@ public record SourceFunctionSignature(List<Argument> arguments) {
         /** A string constant, quoting removed. A name is written as one. */
         STRING("a string"),
         /** A {@code {...}} of named values. */
-        NAMED_VALUES("a {...}");
+        NAMED_VALUES("a {...}"),
+        /** A whole number, written as an integer or a long constant. A count or a bound is one. */
+        WHOLE_NUMBER("a whole number");
 
-        // Adding a kind here is not only a constant and a switch arm. A payload's values are whitelisted by type
-        // in LogicalPlanBuilder.SOURCE_FUNCTION_VALUE_TYPES for reasons that apply just as much to a positional
-        // constant -- UNSIGNED_LONG's stored long is a biased representation, and a time duration folds to a
-        // java.time.Period -- and nothing filters a positional one, because no kind here admits a number today.
-        // Whoever adds one inherits that, and should read that whitelist before deciding what the new kind lets
-        // through.
+        // Adding a kind here is not only a constant and a switch arm. Nothing filters a positional constant on its
+        // way in -- LogicalPlanBuilder builds one from whatever the literal folded to -- so every kind below has to
+        // do its own filtering, and the types that make that necessary are the ones a Java class test cannot tell
+        // apart from what it wants: UNSIGNED_LONG's stored long is a biased representation rather than the number
+        // written, and a time duration folds to a java.time.Period. WHOLE_NUMBER tests the DataType for exactly
+        // that reason. LogicalPlanBuilder.SOURCE_FUNCTION_VALUE_TYPES whitelists a payload's values against the
+        // same hazards, and is worth reading before deciding what a new kind lets through.
 
         private final String describedAs;
 
@@ -73,6 +77,11 @@ public record SourceFunctionSignature(List<Argument> arguments) {
     /** A required {@code {...}} payload, in any position. */
     public static Argument namedValues(String name) {
         return new Argument(name, Kind.NAMED_VALUES, true);
+    }
+
+    /** A required argument written as a whole number. A count, a bound or a step is one. */
+    public static Argument wholeNumber(String name) {
+        return new Argument(name, Kind.WHOLE_NUMBER, true);
     }
 
     /**
@@ -141,6 +150,13 @@ public record SourceFunctionSignature(List<Argument> arguments) {
                 // NULL is a constant too. One single string is the whole of what a name can be.
                 case STRING -> actual instanceof SourceFunctionArgument.Value value && value.value() instanceof String;
                 case NAMED_VALUES -> actual instanceof SourceFunctionArgument.NamedValues;
+                // Both the declared type and the Java class, and the type half is the load-bearing one. An
+                // UNSIGNED_LONG also arrives holding a Long, but that long is a biased representation rather than
+                // the number written, so a class test on its own would hand a function a value 2^63 away from what
+                // the query said. Testing the type admits exactly the two widths a user can write a count in.
+                case WHOLE_NUMBER -> actual instanceof SourceFunctionArgument.Value value
+                    && (value.type() == DataType.INTEGER || value.type() == DataType.LONG)
+                    && (value.value() instanceof Integer || value.value() instanceof Long);
             };
             if (matches == false) {
                 throw new ParsingException(actual.source(), "[{}] expects {} for [{}]", call.name(), expected.kind(), expected.name());

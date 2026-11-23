@@ -59,6 +59,16 @@ public record SourceFunctionInvocation(Source source, String name, List<SourceFu
     }
 
     /**
+     * The {@code i}th argument as a whole number, or {@code null} when the call had no argument there, as
+     * {@link #string(int)} answers. An integer and a long both arrive as a {@code long}, because which width a
+     * user happened to write a count in is not something a function should branch on. Safe once
+     * {@link SourceFunction#signature()} has checked the call, which is what makes the cast sound.
+     */
+    public Long number(int i) {
+        return i < arguments.size() ? ((Number) ((SourceFunctionArgument.Value) arguments.get(i)).value()).longValue() : null;
+    }
+
+    /**
      * The name and how many arguments there were, never what was in them. A record's generated {@code toString}
      * renders every component, and an argument may be a definition carrying credentials, so the generated one
      * would put them wherever anyone writes {@code logger.debug("{}", call)}. The leaf that holds an invocation
