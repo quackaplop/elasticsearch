@@ -174,6 +174,7 @@ import org.elasticsearch.xpack.esql.querydsl.query.SingleValueQuery;
 import org.elasticsearch.xpack.esql.querylog.EsqlQueryLog;
 import org.elasticsearch.xpack.esql.session.EsqlLicenseChecker;
 import org.elasticsearch.xpack.esql.session.IndexResolver;
+import org.elasticsearch.xpack.esql.sourcefunction.SeriesFunction;
 import org.elasticsearch.xpack.esql.sourcefunction.SourceFunction;
 import org.elasticsearch.xpack.esql.sourcefunction.SourceFunctionRegistry;
 import org.elasticsearch.xpack.esql.sourcefunction.SourceFunctionResolver;
@@ -1076,7 +1077,7 @@ public class EsqlPlugin extends Plugin implements ActionPlugin, ExtensiblePlugin
      * on a release build in the way a name nobody registered is unavailable.
      */
     protected List<SourceFunction> snapshotSourceFunctions() {
-        return List.of();
+        return List.of(SeriesFunction.generateSeries(), SeriesFunction.range());
     }
 
     @Override
