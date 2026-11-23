@@ -2640,8 +2640,8 @@ public class EsqlSession {
      * A {@code FROM a, b} union ({@code Fork}/{@code UnionAll}) instead reads from every branch, so all of its children are followed.
      * The behavior is validated by {@code CrossClusterInSubqueryIT.testMissingLookupIndexAfterWhereInSubquery}
      * <p>
-     * Each index source contributes the clusters its pattern resolved to; a {@link Row} - a coordinator-only source carrying no index
-     * relation - contributes the local cluster. The behavior is validated by
+     * Each index source contributes the clusters its pattern resolved to; a {@link Row} or a {@link LocalRelation} - a coordinator-only
+     * source carrying no index relation - contributes the local cluster. The behavior is validated by
      * {@code CrossClusterInSubqueryIT.testMissingLookupIndexInsideWhereInSubquery} and
      * {@code CrossClusterSubqueryIT.testSubqueryWithRowAndLookupIndicesMissingOnClustersReferencedBySubquery}.
      */
@@ -2654,6 +2654,12 @@ public class EsqlSession {
                 }
             }
             case Row row -> scope.add(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY);
+            // A source function that answered with rows it built is a coordinator-only source for the same reason
+            // Row is: the rows never came from an index, so the cluster they belong to is the local one. Without
+            // this, a function beside a remote index leaves the local cluster out of scope entirely, and a
+            // following LOOKUP JOIN or ENRICH is resolved against the remote alone -- so a local lookup index or
+            // enrich policy is reported missing rather than read.
+            case LocalRelation local -> scope.add(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY);
             // The EQL engine returns its matches to the coordinator, so its rows are local even when its pattern targets a remote.
             case UnresolvedEqlRelation eql -> scope.add(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY);
             case IndependentSubqueryJoin subqueryJoin -> collectSourceClusterScope(subqueryJoin.left(), scope, indexResolution);
